@@ -132,7 +132,7 @@ bool Catalog::load_cache()
 
 std::string Catalog::media_url(const std::string& path) const
 {
-    if (path.empty() || starts_with(path, "http://") || starts_with(path, "https://"))
+    if (path.empty() || path.find(':') != std::string::npos)
         return path;
     return media + path;
 }
@@ -252,7 +252,8 @@ static int load_nps(std::vector<Entry>& out, const std::string& path, bool dlc)
 void Catalog::apply_covers()
 {
     std::string text;
-    if (!fs::read(APP_DIR + "/covers.json", text))
+    bool bundled = fs::exists("app0:covers.json");
+    if (!fs::read(APP_DIR + "/covers.json", text) && !fs::read("app0:covers.json", text))
         return;
     Json::CharReaderBuilder b;
     Json::Value root;
@@ -264,8 +265,10 @@ void Catalog::apply_covers()
         const Json::Value& v = root[e.id];
         if (!v.isObject())
             continue;
-        if (e.icon.empty())
-            e.icon = str(v, "c");
+        if (e.icon.empty()) {
+            std::string c = str(v, "c");
+            e.icon = bundled && starts_with(c, "covers/") ? "app0:" + c : c;
+        }
         if (e.shots.empty() && v["s"].isArray())
             for (const auto& s : v["s"])
                 if (s.isString())

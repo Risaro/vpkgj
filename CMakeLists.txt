@@ -97,3 +97,14 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
        assets/Inter-Regular.ttf assets/Inter-Regular.ttf
        assets/Inter-SemiBold.ttf assets/Inter-SemiBold.ttf
 )
+
+set(VPKGJ_COVERS "${CMAKE_SOURCE_DIR}/../db" CACHE PATH "vpkgj-db checkout with media/covers and covers.json")
+if(EXISTS "${VPKGJ_COVERS}/covers.json" AND EXISTS "${VPKGJ_COVERS}/media/covers")
+  add_custom_command(TARGET ${PROJECT_NAME}.vpk-vpk POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/bundle"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bundle/covers"
+    COMMAND ${CMAKE_COMMAND} -E copy "${VPKGJ_COVERS}/covers.json" "${CMAKE_BINARY_DIR}/bundle/covers.json"
+    COMMAND sh -c "cd '${VPKGJ_COVERS}/media' && find covers -name c.jpg | while read f; do mkdir -p '${CMAKE_BINARY_DIR}/bundle/'$(dirname $f) && cp $f '${CMAKE_BINARY_DIR}/bundle/'$f; done"
+    COMMAND sh -c "cd '${CMAKE_BINARY_DIR}/bundle' && zip -q -0 -r '${CMAKE_BINARY_DIR}/${PROJECT_NAME}.vpk' covers covers.json"
+    VERBATIM)
+endif()
