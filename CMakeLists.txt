@@ -45,6 +45,7 @@ target_link_libraries(vpkgj
   vita2d
   freetype
   png
+  turbojpeg
   jpeg
   jsoncpp
   minizip

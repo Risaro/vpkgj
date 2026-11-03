@@ -7,6 +7,7 @@
 #include <psp2/kernel/threadmgr.h>
 
 #include <minizip/unzip.h>
+#include <turbojpeg.h>
 
 #include <algorithm>
 #include <vector>
@@ -21,7 +22,7 @@ void Images::start()
     fs::mkdirs(CACHE);
     Images* self = this;
     for (int i = 0; i < 3; i++) {
-        SceUID th = sceKernelCreateThread("vpkgj_images", worker, 0x10000100, 128 * 1024, 0, 0, nullptr);
+        SceUID th = sceKernelCreateThread("vpkgj_images", worker, 0x10000100, 256 * 1024, 0, 0, nullptr);
         sceKernelStartThread(th, sizeof(self), &self);
         threads.push_back(th);
     }
@@ -120,6 +121,53 @@ void Images::clear_disk()
     fs::mkdirs(CACHE);
 }
 
+static vita2d_texture* decode_jpeg(const uint8_t* data, size_t size)
+{
+    tjhandle h = tjInitDecompress();
+    if (!h)
+        return nullptr;
+    int w = 0, hh = 0, ss = 0, cs = 0;
+    vita2d_texture* tex = nullptr;
+    if (tjDecompressHeader3(h, data, size, &w, &hh, &ss, &cs) == 0 && w > 0 && hh > 0) {
+        int sw = w, sh = hh;
+        int n = 0;
+        tjscalingfactor* sf = tjGetScalingFactors(&n);
+        for (int i = 0; i < n && (sw > 1024 || sh > 1024); i++) {
+            int tw = TJSCALED(w, sf[i]), th = TJSCALED(hh, sf[i]);
+            if (tw <= 1024 && th <= 1024 && tw < sw) {
+                sw = tw;
+                sh = th;
+            }
+        }
+        tex = vita2d_create_empty_texture(sw, sh);
+        if (tex) {
+            int pitch = vita2d_texture_get_stride(tex);
+            if (tjDecompress2(h, data, size, (unsigned char*)vita2d_texture_get_datap(tex), sw, pitch, sh, TJPF_RGBA, TJFLAG_FASTDCT) != 0 &&
+                tjGetErrorCode(h) == TJERR_FATAL) {
+                vita2d_free_texture(tex);
+                tex = nullptr;
+            }
+        }
+    }
+    tjDestroy(h);
+    return tex;
+}
+
+static vita2d_texture* load_file(const std::string& path)
+{
+    std::string data;
+    if (!fs::read(path, data) || data.size() < 4)
+        return nullptr;
+    const uint8_t* b = (const uint8_t*)data.data();
+    if (b[0] == 0xFF && b[1] == 0xD8)
+        return decode_jpeg(b, data.size());
+    if (b[0] == 0x89 && b[1] == 'P')
+        return vita2d_load_PNG_buffer(b);
+    if (b[0] == 'B' && b[1] == 'M')
+        return vita2d_load_BMP_buffer(b);
+    return nullptr;
+}
+
 static std::mutex pak_lock;
 
 static vita2d_texture* load_pak(const std::string& name)
@@ -159,7 +207,7 @@ static vita2d_texture* load_pak(const std::string& name)
         return nullptr;
     }
     if (buf[0] == 0xFF && buf[1] == 0xD8)
-        return vita2d_load_JPEG_buffer(buf.data(), buf.size());
+        return decode_jpeg(buf.data(), buf.size());
     if (buf[0] == 0x89 && buf[1] == 'P')
         return vita2d_load_PNG_buffer(buf.data());
     return nullptr;
@@ -196,21 +244,9 @@ void Images::load(const std::string& url)
         if (!net::fetch(url, path, nullptr, err))
             log_line("image %s: %s", url.c_str(), err.c_str());
     }
-    vita2d_texture* tex = nullptr;
-    SceUID f = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
-    if (f >= 0) {
-        unsigned char b[4] = {0};
-        sceIoRead(f, b, 4);
-        sceIoClose(f);
-        if (b[0] == 0x89 && b[1] == 'P')
-            tex = vita2d_load_PNG_file(path.c_str());
-        else if (b[0] == 0xFF && b[1] == 0xD8)
-            tex = vita2d_load_JPEG_file(path.c_str());
-        else if (b[0] == 'B' && b[1] == 'M')
-            tex = vita2d_load_BMP_file(path.c_str());
-        if (!tex && !local)
-            sceIoRemove(path.c_str());
-    }
+    vita2d_texture* tex = load_file(path);
+    if (!tex && !local)
+        sceIoRemove(path.c_str());
     if (tex)
         vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     std::lock_guard<std::mutex> lock(m);
