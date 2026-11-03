@@ -184,6 +184,7 @@ struct App {
     bool only_ru = false;
     bool only_installed = false;
     bool hide_dlc = false;
+    bool only_data = false;
     bool filters_open = false;
     int filter_sel = 0;
     void draw_filters();
@@ -266,6 +267,8 @@ void App::rebuild()
                 continue;
             if (only_installed && status_of(e) == ST_NONE)
                 continue;
+            if (only_data && (c != CAT_PORTS || e.data.empty()))
+                continue;
             filtered[c].push_back(i);
         }
         if (sort_mode) {
@@ -299,15 +302,17 @@ std::string App::filter_summary()
         add("Установленные");
     if (hide_dlc)
         add("Без DLC");
+    if (only_data)
+        add("С готовой data");
     return s;
 }
 
 void App::input_filters(uint32_t act)
 {
     if (act & SCE_CTRL_UP)
-        filter_sel = (filter_sel + 4) % 5;
+        filter_sel = (filter_sel + 5) % 6;
     if (act & SCE_CTRL_DOWN)
-        filter_sel = (filter_sel + 1) % 5;
+        filter_sel = (filter_sel + 1) % 6;
     int d = (act & SCE_CTRL_LEFT) ? -1 : (act & (SCE_CTRL_RIGHT | ok_btn)) ? 1 : 0;
     if (d) {
         if (filter_sel == 0)
@@ -318,8 +323,10 @@ void App::input_filters(uint32_t act)
             only_ru = !only_ru;
         else if (filter_sel == 3)
             only_installed = !only_installed;
-        else
+        else if (filter_sel == 4)
             hide_dlc = !hide_dlc;
+        else
+            only_data = !only_data;
         rebuild();
         if (tab < CAT_COUNT) {
             sel[tab] = 0;
@@ -328,7 +335,7 @@ void App::input_filters(uint32_t act)
     }
     if (pressed & SCE_CTRL_TRIANGLE) {
         sort_mode = region_mode = 0;
-        only_ru = only_installed = hide_dlc = false;
+        only_ru = only_installed = hide_dlc = only_data = false;
         rebuild();
     }
     if (pressed & (back_btn | SCE_CTRL_SELECT))
@@ -338,7 +345,7 @@ void App::input_filters(uint32_t act)
 void App::draw_filters()
 {
     gfx::rect(0, 0, W, H, gfx::alpha(RGBA8(0, 0, 0, 255), 0.55f));
-    float w = 520, h = 330, x = (W - w) / 2, y = (H - h) / 2 - 10;
+    float w = 520, h = 378, x = (W - w) / 2, y = (H - h) / 2 - 10;
     gfx::rrect(x, y, w, h, 20, col::SURFACE);
     gfx::text(gfx::bold, x + 28, y + 42, 20, col::TEXT, "Сортировка и фильтры");
     struct Row {
@@ -349,8 +356,9 @@ void App::draw_filters()
         {"Только с русским языком", only_ru ? "да" : "нет"},
         {"Только установленные", only_installed ? "да" : "нет"},
         {"Скрыть DLC", hide_dlc ? "да" : "нет"},
+        {"Порты с готовой data", only_data ? "да" : "нет"},
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
         float ry = y + 64 + i * 48;
         bool on = i == filter_sel;
         gfx::rrect(x + 16, ry, w - 32, 40, 10, on ? col::SURFACE2 : gfx::alpha(col::SURFACE2, 0.4f));
@@ -1412,13 +1420,23 @@ void App::draw_card(const Entry& e, float x, float y)
     } else if (st == ST_INSTALLED) {
         draw_badge(bx, y + 8, "Установлено", col::GREEN, col::BG);
     }
+    float lx = x + 8;
     if (!e.lang.empty()) {
         std::string l = e.lang;
         for (auto& c : l)
             c = toupper(c);
         int w = gfx::width(gfx::bold, 11, l) + 14;
-        gfx::rrect(x + 8, y + 8, w, 20, 10, gfx::alpha(col::BG, 0.75f));
-        gfx::text(gfx::bold, x + 15, y + 22, 11, col::TEXT, l);
+        gfx::rrect(lx, y + 8, w, 20, 10, gfx::alpha(col::BG, 0.75f));
+        gfx::text(gfx::bold, lx + 7, y + 22, 11, col::TEXT, l);
+        lx += w + 4;
+    }
+    if (e.cat == CAT_PORTS) {
+        std::string l = e.data.empty() ? (e.data_path.empty() ? "" : "СВОИ ФАЙЛЫ") : "DATA";
+        if (!l.empty()) {
+            int w = gfx::width(gfx::bold, 11, l) + 14;
+            gfx::rrect(lx, y + 8, w, 20, 10, e.data.empty() ? gfx::alpha(col::BG, 0.75f) : col::GREEN);
+            gfx::text(gfx::bold, lx + 7, y + 22, 11, e.data.empty() ? col::ORANGE : col::BG, l);
+        }
     }
 
     gfx::text(gfx::bold, x + 12, y + CARD_IMG_H + 26, 15, col::TEXT, gfx::ellipsize(gfx::bold, 15, e.name, CARD_W - 24));
@@ -1651,8 +1669,14 @@ void App::draw_detail()
         chip(e.region, col::TEXT);
     if (!e.game_version.empty())
         chip("Для версии " + e.game_version, col::TEXT);
-    if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW)
-        chip(e.data.empty() ? "Без data" : "vpk + data", col::TEXT);
+    if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW) {
+        if (!e.data.empty())
+            chip("Data скачается и встанет сама", col::GREEN);
+        else if (!e.data_path.empty())
+            chip("Нужны свои файлы игры: " + e.data_path, col::ORANGE);
+        else
+            chip("Data не нужна", col::TEXT);
+    }
     if (e.cat == CAT_TRANSLATIONS && lower(e.install).find("plugin") != std::string::npos)
         chip("Нужен плагин, ставится сам", col::TEXT);
     if (e.cat == CAT_PLUGINS && !e.tai_section.empty())
