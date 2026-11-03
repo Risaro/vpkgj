@@ -497,11 +497,19 @@ void App::ask_install(const Entry& e, bool reinstall)
     }
     std::vector<Entry> deps = deps_of(e);
     std::string need;
-    for (auto& d : deps)
-        if (!plugin_present(d))
+    std::string manual;
+    for (auto& d : deps) {
+        if (plugin_present(d))
+            continue;
+        if (d.url.empty())
+            manual += (manual.empty() ? "" : ", ") + d.name;
+        else
             need += (need.empty() ? "" : ", ") + d.name;
+    }
     if (!need.empty())
         modal.lines.push_back("Сначала поставится: " + need);
+    if (!manual.empty())
+        modal.lines.push_back("Нужно поставить вручную: " + manual);
     modal.yes = reinstall ? "Переустановить" : "Установить";
     Entry copy = e;
     modal.action = [this, copy, deps]() {
@@ -539,6 +547,10 @@ void App::primary_action()
         modal.lines.push_back(e.name);
         modal.yes = "Отменить";
         modal.action = [t]() { t->progress.cancel = true; };
+        return;
+    }
+    if (e.cat == CAT_PLUGINS && e.url.empty()) {
+        show_toast(plugin_present(e) ? e.name + " уже на месте" : e.description);
         return;
     }
     Status st = installed.status(e);
@@ -1218,7 +1230,8 @@ void App::draw_detail()
     if (e.cat == CAT_PLUGINS && !e.tai_section.empty())
         chip(e.tai_section, col::TEXT);
     for (size_t i = 0; i < detail_deps.size(); i++)
-        chip(detail_deps[i].name + (detail_dep_ok[i] ? ": есть" : ": поставится сам"), detail_dep_ok[i] ? col::GREEN : col::ORANGE);
+        chip(detail_deps[i].name + (detail_dep_ok[i] ? ": есть" : detail_deps[i].url.empty() ? ": нет, см. описание" : ": поставится сам"),
+             detail_dep_ok[i] ? col::GREEN : detail_deps[i].url.empty() ? col::RED : col::ORANGE);
     if (st == ST_INSTALLED)
         chip("Установлено", col::GREEN);
     if (st == ST_UPDATE)

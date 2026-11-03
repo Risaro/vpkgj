@@ -227,6 +227,17 @@ bool plugin_present(const Entry& p)
         size_t q = name.find('?');
         keys.push_back(lower(q == std::string::npos ? name : name.substr(0, q)));
     }
+    bool files_only = !keys.empty();
+    for (auto& k : keys) {
+        if (starts_with(k, "file:")) {
+            if (fs::exists(k.substr(5)))
+                return true;
+        } else {
+            files_only = false;
+        }
+    }
+    if (files_only)
+        return false;
     std::istringstream in(cfg);
     std::string line;
     while (std::getline(in, line)) {
@@ -245,6 +256,11 @@ static bool install_deps(Task& t, std::string& err)
     for (auto& d : t.deps) {
         if (plugin_present(d))
             continue;
+        if (d.url.empty()) {
+            std::lock_guard<std::mutex> lock(t.m);
+            t.note = "Не хватает " + d.name + ". " + d.description;
+            continue;
+        }
         t.set_stage("Ставлю " + d.name);
         std::string f = APP_DIR + "/dl/dep_" + hash_name(d.id + d.url);
         bool ok = download(t, links(d.url, d.mirror), f, err) && install_plugin_files(t, d, f, d.tai_section, err);
