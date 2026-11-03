@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -81,7 +82,9 @@ public:
 private:
     std::mutex m;
     std::map<std::string, std::string> versions;
-    std::map<std::string, bool> app_cache;
+    std::set<std::string> present;
+    bool scanned = false;
+    void scan();
     void save();
     bool app_exists(const std::string& titleid);
 };

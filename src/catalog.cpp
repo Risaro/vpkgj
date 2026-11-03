@@ -405,7 +405,7 @@ void Installed::set(const Entry& e)
 {
     std::lock_guard<std::mutex> lock(m);
     versions[key(e)] = e.version.empty() ? "-" : e.version;
-    app_cache.clear();
+    scanned = false;
     save();
 }
 
@@ -413,24 +413,32 @@ void Installed::remove(const Entry& e)
 {
     std::lock_guard<std::mutex> lock(m);
     versions.erase(key(e));
-    app_cache.clear();
+    scanned = false;
     save();
 }
 
 void Installed::refresh()
 {
     std::lock_guard<std::mutex> lock(m);
-    app_cache.clear();
+    scanned = false;
+}
+
+void Installed::scan()
+{
+    present.clear();
+    for (auto& id : fs::list("ux0:app"))
+        present.insert(id);
+    for (auto& id : fs::list("ux0:addcont"))
+        for (auto& sub : fs::list("ux0:addcont/" + id))
+            present.insert("dlc:ux0:addcont/" + id + "/" + sub);
+    scanned = true;
 }
 
 bool Installed::app_exists(const std::string& titleid)
 {
-    auto it = app_cache.find(titleid);
-    if (it != app_cache.end())
-        return it->second;
-    bool ok = starts_with(titleid, "dlc:") ? fs::exists(titleid.substr(4)) : fs::exists("ux0:app/" + titleid + "/eboot.bin");
-    app_cache[titleid] = ok;
-    return ok;
+    if (!scanned)
+        scan();
+    return present.count(titleid) > 0;
 }
 
 Status Installed::status(const Entry& e)

@@ -2342,7 +2342,6 @@ void App::run()
             sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
         static uint64_t last_refresh = 0;
         if (now_ms() - last_refresh > 2000) {
-            installed.refresh();
             if (screen == SCR_DETAIL)
                 check_deps();
             last_refresh = now_ms();
