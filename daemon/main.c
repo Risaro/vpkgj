@@ -31,6 +31,7 @@ static char* installed;
 static char* versions;
 static char* notified;
 static char* fresh;
+static char* queue_buf;
 static int fresh_len;
 static int found;
 static char first_name[96];
@@ -350,9 +351,43 @@ static void check(void)
     notify(text);
 }
 
+static void drain_queue(void)
+{
+    SceIoStat st;
+    if (sceIoGetstat(DIR "/notify.txt", &st) < 0)
+        return;
+    sceIoRemove(DIR "/notify.work");
+    if (sceIoRename(DIR "/notify.txt", DIR "/notify.work") < 0)
+        return;
+    read_file(DIR "/notify.work", queue_buf, 4096);
+    sceIoRemove(DIR "/notify.work");
+    char* p = queue_buf;
+    while (*p) {
+        char* e = p;
+        while (*e && *e != '\n')
+            e++;
+        char c = *e;
+        *e = 0;
+        if (e > p && e[-1] == '\r')
+            e[-1] = 0;
+        if (*p) {
+            notify(p);
+            sceKernelDelayThread(1500 * 1000);
+        }
+        if (!c)
+            break;
+        p = e + 1;
+    }
+}
+
 static int daemon_thread(SceSize args, void* argp)
 {
-    sceKernelDelayThread(90 * 1000 * 1000);
+    taiGetModuleExportFunc("SceLsdb", 0xFFFFFFFF, 0x315B9FD6, (uintptr_t*)&lsdb_send);
+    sceKernelDelayThread(20 * 1000 * 1000);
+    for (int i = 0; i < 14; i++) {
+        drain_queue();
+        sceKernelDelayThread(5 * 1000 * 1000);
+    }
     sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
     sceSysmoduleLoadModule(SCE_SYSMODULE_HTTPS);
     if (sceNetShowNetstat() == SCE_NET_ERROR_ENOTINIT) {
@@ -366,12 +401,18 @@ static int daemon_thread(SceSize args, void* argp)
     sceHttpInit(0x40000);
     sceSslInit(0x40000);
     sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY);
-    taiGetModuleExportFunc("SceLsdb", 0xFFFFFFFF, 0x315B9FD6, (uintptr_t*)&lsdb_send);
+    unsigned ticks = 0;
     for (;;) {
         SceIoStat st;
-        if (sceIoGetstat(DIR "/daemon_off", &st) < 0)
+        int off = sceIoGetstat(DIR "/daemon_off", &st) >= 0;
+        if (!off && ticks % 4320 == 0)
             check();
-        sceKernelDelayThread(6u * 60 * 60 * 1000 * 1000);
+        if (!off)
+            drain_queue();
+        else
+            sceIoRemove(DIR "/notify.txt");
+        ticks++;
+        sceKernelDelayThread(5 * 1000 * 1000);
     }
     return 0;
 }
@@ -401,7 +442,7 @@ int module_start(SceSize argc, const void* args)
     default:
         return SCE_KERNEL_START_FAILED;
     }
-    taipool_init(INDEX_MAX + CHUNK + 2048 + 32 * 1024 * 2 + 64 * 1024 + 16 * 1024 + NET_SIZE + 64 * 1024);
+    taipool_init(INDEX_MAX + CHUNK + 2048 + 32 * 1024 * 2 + 64 * 1024 + 16 * 1024 + 4096 + NET_SIZE + 64 * 1024);
     index_buf = taipool_alloc(INDEX_MAX);
     chunk = taipool_alloc(CHUNK);
     line = taipool_alloc(2048);
@@ -409,7 +450,8 @@ int module_start(SceSize argc, const void* args)
     versions = taipool_alloc(32 * 1024);
     notified = taipool_alloc(64 * 1024);
     fresh = taipool_alloc(16 * 1024);
-    if (!index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
+    queue_buf = taipool_alloc(4096);
+    if (!queue_buf || !index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
         return SCE_KERNEL_START_FAILED;
     SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xA0, 0x8000, 0, 0, 0);
     if (th >= 0)

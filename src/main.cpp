@@ -14,7 +14,6 @@
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
-#include <psp2/notificationutil.h>
 #include <psp2/sysmodule.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
@@ -112,6 +111,7 @@ struct App {
     void saves_menu(const Entry& e);
     void check_reboot();
     bool daemon_enabled();
+    void daemon_notify(const std::string& text);
     void toggle_daemon();
     int daemon_state = -1;
     int dl_sel = 0;
@@ -298,33 +298,6 @@ std::vector<Entry> App::collect_updates()
     return out;
 }
 
-static void system_notify(const std::string& text)
-{
-    static bool loaded = false;
-    if (!loaded) {
-        sceSysmoduleLoadModule(SCE_SYSMODULE_NOTIFICATION_UTIL);
-        loaded = true;
-    }
-    SceWChar16 buf[SCE_NOTIFICATIONUTIL_TEXT_MAX + 1];
-    memset(buf, 0, sizeof(buf));
-    size_t n = 0, i = 0;
-    while (i < text.size() && n < SCE_NOTIFICATIONUTIL_TEXT_MAX - 1) {
-        unsigned char c = text[i];
-        uint32_t cp = c;
-        if (c >= 0xe0 && i + 2 < text.size()) {
-            cp = ((c & 0x0f) << 12) | ((text[i + 1] & 0x3f) << 6) | (text[i + 2] & 0x3f);
-            i += 3;
-        } else if (c >= 0xc0 && i + 1 < text.size()) {
-            cp = ((c & 0x1f) << 6) | (text[i + 1] & 0x3f);
-            i += 2;
-        } else {
-            i += 1;
-        }
-        buf[n++] = (SceWChar16)cp;
-    }
-    sceNotificationUtilSendNotification(buf);
-}
-
 void App::notify_updates()
 {
     auto ups = collect_updates();
@@ -334,21 +307,38 @@ void App::notify_updates()
     std::string seen;
     fs::read(APP_DIR + "/notified.txt", seen);
     std::string add;
-    int sent = 0;
+    std::vector<std::string> names;
     for (auto& u : ups) {
         std::string key = std::string(category_key(u.cat)) + "/" + u.id + "/" + u.version + "\n";
         if (seen.find(key) != std::string::npos)
             continue;
         add += key;
-        if (sent < 3)
-            system_notify("Обновление: " + u.name + " " + u.version);
-        sent++;
+        names.push_back(u.name + " " + u.version);
     }
-    if (sent > 3)
-        system_notify("И ещё обновлений: " + std::to_string(sent - 3));
     if (!add.empty())
         fs::write(APP_DIR + "/notified.txt", seen + add);
-    show_toast("Доступно обновлений: " + std::to_string(updates_count) + ", смотри вкладку Загрузки");
+    if (names.size() == 1)
+        daemon_notify("Вышло обновление: " + names[0]);
+    else if (names.size() > 1)
+        daemon_notify("Доступно обновлений: " + std::to_string(names.size()));
+    if (names.empty() || modal.on) {
+        show_toast("Доступно обновлений: " + std::to_string(updates_count) + ", смотри вкладку Загрузки");
+        return;
+    }
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Новые обновления: " + std::to_string(names.size());
+    for (size_t i = 0; i < names.size() && i < 5; i++)
+        modal.lines.push_back(names[i]);
+    if (names.size() > 5)
+        modal.lines.push_back("и ещё " + std::to_string(names.size() - 5));
+    modal.yes = "Обновить всё";
+    modal.action = [this]() {
+        auto list = collect_updates();
+        for (auto& u : list)
+            tasks.add(u, deps_of(u));
+        show_toast("В очередь добавлено обновлений: " + std::to_string(list.size()));
+    };
 }
 
 const Entry* App::selected()
@@ -1443,6 +1433,21 @@ bool App::daemon_enabled()
     return daemon_state == 1;
 }
 
+void App::daemon_notify(const std::string& text)
+{
+    if (!daemon_enabled())
+        return;
+    std::string q;
+    fs::read(APP_DIR + "/notify.txt", q);
+    std::string line = text;
+    for (auto& c : line)
+        if (c == '\n' || c == '\r')
+            c = ' ';
+    if (line.size() > 120)
+        line = line.substr(0, 120);
+    fs::write(APP_DIR + "/notify.txt", q + line + "\n");
+}
+
 void App::toggle_daemon()
 {
     std::string err;
@@ -1485,8 +1490,13 @@ void App::check_reboot()
     if (modal.on)
         return;
     for (auto& t : tasks.list()) {
+        if (t->state == TS_FAILED && !t->synced) {
+            t->synced = true;
+            daemon_notify("Не удалось установить: " + t->entry.name);
+        }
         if (t->state == TS_DONE && !t->synced) {
             t->synced = true;
+            daemon_notify("Установлено: " + t->entry.name);
             if (t->entry.cat == CAT_GAMES) {
                 catalog.load_updates();
                 updates_count = (int)collect_updates().size();

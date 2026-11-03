@@ -69,7 +69,6 @@ target_link_libraries(vpkgj
   SceDisplay_stub
   SceGxm_stub
   SceIme_stub
-  SceNotificationUtil_stub
   SceNet_stub
   SceNetCtl_stub
   ScePgf_stub
