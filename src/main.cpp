@@ -33,6 +33,7 @@
 #define VPKGJ_VERSION "1.0"
 
 int _newlib_heap_size_user = 160 * 1024 * 1024;
+unsigned int sceUserMainThreadStackSize = 1 * 1024 * 1024;
 
 static const int W = 960;
 static const int H = 544;
@@ -1836,8 +1837,8 @@ void App::check_reboot()
             t->synced = true;
             daemon_notify("Установлено: " + t->entry.name);
             if (t->entry.cat == CAT_GAMES) {
-                catalog.load_updates();
-                refresh_updates();
+                installed.refresh();
+                start_refresh(false);
             } else {
                 installed.refresh();
                 refresh_updates();
