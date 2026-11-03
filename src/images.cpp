@@ -19,17 +19,20 @@ static const size_t BUDGET = 56u * 1024 * 1024;
 void Images::start()
 {
     fs::mkdirs(CACHE);
-    thread = sceKernelCreateThread("vpkgj_images", worker, 0x10000100, 128 * 1024, 0, 0, nullptr);
     Images* self = this;
-    sceKernelStartThread(thread, sizeof(self), &self);
+    for (int i = 0; i < 3; i++) {
+        SceUID th = sceKernelCreateThread("vpkgj_images", worker, 0x10000100, 128 * 1024, 0, 0, nullptr);
+        sceKernelStartThread(th, sizeof(self), &self);
+        threads.push_back(th);
+    }
 }
 
 void Images::stop()
 {
     quit = true;
-    if (thread >= 0) {
+    for (auto th : threads) {
         SceUInt timeout = 3 * 1000 * 1000;
-        sceKernelWaitThreadEnd(thread, nullptr, &timeout);
+        sceKernelWaitThreadEnd(th, nullptr, &timeout);
     }
     vita2d_wait_rendering_done();
     for (auto& kv : cache)
@@ -117,26 +120,44 @@ void Images::clear_disk()
     fs::mkdirs(CACHE);
 }
 
+static std::mutex pak_lock;
+
 static vita2d_texture* load_pak(const std::string& name)
 {
+    std::vector<uint8_t> buf;
+    {
+        std::lock_guard<std::mutex> lock(pak_lock);
     static unzFile pak = nullptr;
     static bool tried = false;
+    static std::map<std::string, unz64_file_pos> index;
     if (!tried) {
         tried = true;
         pak = unzOpen64("app0:covers.pak");
+        if (pak && unzGoToFirstFile(pak) == UNZ_OK) {
+            do {
+                char n[256];
+                unz64_file_pos pos;
+                unz_file_info64 fi;
+                if (unzGetCurrentFileInfo64(pak, &fi, n, sizeof(n), nullptr, 0, nullptr, 0) == UNZ_OK &&
+                    unzGetFilePos64(pak, &pos) == UNZ_OK)
+                    index[n] = pos;
+            } while (unzGoToNextFile(pak) == UNZ_OK);
+        }
     }
-    if (!pak || unzLocateFile(pak, name.c_str(), 0) != UNZ_OK)
+    auto it = index.find(name);
+    if (!pak || it == index.end() || unzGoToFilePos64(pak, &it->second) != UNZ_OK)
         return nullptr;
     unz_file_info64 info;
     if (unzGetCurrentFileInfo64(pak, &info, nullptr, 0, nullptr, 0, nullptr, 0) != UNZ_OK || info.uncompressed_size > 8u * 1024 * 1024)
         return nullptr;
     if (unzOpenCurrentFile(pak) != UNZ_OK)
         return nullptr;
-    std::vector<uint8_t> buf(info.uncompressed_size);
+    buf.resize(info.uncompressed_size);
     int r = unzReadCurrentFile(pak, buf.data(), buf.size());
     unzCloseCurrentFile(pak);
     if (r != (int)buf.size() || buf.size() < 4)
         return nullptr;
+    }
     if (buf[0] == 0xFF && buf[1] == 0xD8)
         return vita2d_load_JPEG_buffer(buf.data(), buf.size());
     if (buf[0] == 0x89 && buf[1] == 'P')

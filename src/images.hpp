@@ -33,7 +33,7 @@ private:
     std::vector<vita2d_texture*> to_free;
     uint64_t frame = 0;
     size_t total = 0;
-    int thread = -1;
+    std::vector<int> threads;
     std::atomic<bool> quit{false};
     static int worker(unsigned int, void* arg);
     void load(const std::string& url);
