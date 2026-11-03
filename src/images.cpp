@@ -14,7 +14,7 @@
 
 enum { IMG_PENDING, IMG_LOADING, IMG_READY, IMG_FAILED };
 
-static const size_t BUDGET = 56u * 1024 * 1024;
+static const size_t BUDGET = 40u * 1024 * 1024;
 #define CACHE (APP_DIR + "/cache")
 
 void Images::start()
@@ -92,6 +92,23 @@ void Images::tick()
         std::lock_guard<std::mutex> lock(m);
         frame++;
         victims.swap(to_free);
+        if (frame % 30 == 0) {
+            uint64_t now = now_ms();
+            for (auto it = cache.begin(); it != cache.end();) {
+                Image& img = it->second;
+                bool stale_ready = img.state == IMG_READY && img.used + 240 < frame && total > BUDGET / 3;
+                bool stale_fail = img.state == IMG_FAILED && now - img.ready_at > 4000;
+                if (stale_ready) {
+                    victims.push_back(img.tex);
+                    total -= img.bytes;
+                    it = cache.erase(it);
+                } else if (stale_fail) {
+                    it = cache.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
         if (total > BUDGET) {
             std::vector<std::pair<uint64_t, std::string>> ready;
             for (auto& kv : cache)
@@ -228,6 +245,7 @@ void Images::load(const std::string& url)
         }
         if (!tex) {
             it->second.state = IMG_FAILED;
+            it->second.ready_at = now_ms();
             return;
         }
         it->second.tex = tex;
@@ -278,6 +296,10 @@ int Images::worker(unsigned int, void* arg)
                 std::string u = self->queue.front();
                 self->queue.pop_front();
                 auto it = self->cache.find(u);
+                if (it != self->cache.end() && it->second.state == IMG_PENDING && it->second.used + 6 < self->frame) {
+                    self->cache.erase(it);
+                    continue;
+                }
                 if (it != self->cache.end() && it->second.state == IMG_PENDING) {
                     it->second.state = IMG_LOADING;
                     url = u;

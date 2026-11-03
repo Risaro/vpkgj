@@ -93,6 +93,8 @@ struct App {
     std::vector<std::string> related_kind;
     std::vector<Entry> back_stack;
     int rel_sel = -1;
+    bool viewer = false;
+    void draw_viewer();
     bool has_saves = false;
     float rel_scroll = 0;
     void go_back();
@@ -377,6 +379,7 @@ void App::open_detail(const Entry& e)
 {
     detail = e;
     rel_sel = -1;
+    viewer = false;
     has_saves = !e.id.empty() && fs::exists(savedata_path(e.id));
     related.clear();
     related_kind.clear();
@@ -761,9 +764,26 @@ void App::input()
         return;
     }
 
+    if (screen == SCR_DETAIL && viewer) {
+        int n = (int)detail.shots.size();
+        if (n > 1 && (act & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT | SCE_CTRL_LTRIGGER | SCE_CTRL_RTRIGGER))) {
+            prev_shot = shot;
+            shot = (shot + ((act & (SCE_CTRL_RIGHT | SCE_CTRL_RTRIGGER)) ? 1 : n - 1)) % n;
+            shot_time = now_ms();
+        }
+        if (pressed & (back_btn | ok_btn | SCE_CTRL_SELECT))
+            viewer = false;
+        return;
+    }
+
     if (screen == SCR_DETAIL) {
         int n = (int)detail.shots.size();
         int rn = (int)related.size();
+        if ((pressed & SCE_CTRL_SELECT) && n) {
+            viewer = true;
+            shot_auto = now_ms() + 600000;
+            return;
+        }
         if (rel_sel >= 0) {
             if (act & SCE_CTRL_LEFT)
                 rel_sel = std::max(0, rel_sel - 1);
@@ -1094,7 +1114,7 @@ void App::draw_grid()
 void App::draw_detail()
 {
     const Entry& e = detail;
-    const float HERO = 300;
+    const float HERO = related.empty() ? 300 : 250;
     int n = (int)e.shots.size();
     if (n > 1 && now_ms() > shot_auto && !touching) {
         prev_shot = shot;
@@ -1142,6 +1162,10 @@ void App::draw_detail()
                             shot = (shot + n - 1) % n;
                             shot_time = now_ms();
                             shot_auto = now_ms() + 8000;
+                        }});
+        hits.push_back({W / 3.0f, 60, W / 3.0f, 160, [this]() {
+                            viewer = true;
+                            shot_auto = now_ms() + 600000;
                         }});
         hits.push_back({W * 2 / 3.0f, 60, W / 3.0f, 160, [this, n]() {
                             prev_shot = shot;
@@ -1357,6 +1381,52 @@ void App::draw_backups()
         hits.push_back({28, y, (float)(W - 56), 62, [this, idx]() { backup_sel = idx; }});
         y += 70;
     }
+}
+
+void App::draw_viewer()
+{
+    hits.clear();
+    gfx::rect(0, 0, W, H, RGBA8(0, 0, 0, 255));
+    int n = (int)detail.shots.size();
+    if (!n) {
+        viewer = false;
+        return;
+    }
+    float fade = std::min(1.0f, (now_ms() - shot_time) / 250.0f);
+    if (prev_shot >= 0 && fade < 1) {
+        vita2d_texture* p = images.get(catalog.media_url(detail.shots[prev_shot]));
+        if (p)
+            gfx::fit(p, 0, 0, W, H, 1 - fade);
+    }
+    float a = 0;
+    vita2d_texture* t = images.get(catalog.media_url(detail.shots[shot]), &a);
+    if (t)
+        gfx::fit(t, 0, 0, W, H, std::min(a, fade));
+    else
+        gfx::spinner(W / 2, H / 2, 14, col::MUTED);
+    for (int i = 1; i <= 1 && n > 1; i++) {
+        images.get(catalog.media_url(detail.shots[(shot + i) % n]));
+        images.get(catalog.media_url(detail.shots[(shot + n - i) % n]));
+    }
+    std::string c = std::to_string(shot + 1) + " / " + std::to_string(n);
+    int w = gfx::width(gfx::bold, 14, c) + 24;
+    gfx::rrect(W - 20 - w, 16, w, 30, 15, gfx::alpha(col::BG, 0.7f));
+    gfx::text(gfx::bold, W - 20 - w + 12, 36, 14, col::TEXT, c);
+    gfx::rrect(20, H - 44, 300, 30, 15, gfx::alpha(col::BG, 0.7f));
+    float x = gfx::hint(30, H - 39, back_icon, "Закрыть");
+    if (n > 1)
+        gfx::text(gfx::regular, x, H - 24, 14, col::MUTED, "← → листать");
+    hits.push_back({0, 0, W / 3.0f, (float)H, [this, n]() {
+                        prev_shot = shot;
+                        shot = (shot + n - 1) % n;
+                        shot_time = now_ms();
+                    }});
+    hits.push_back({W * 2 / 3.0f, 0, W / 3.0f, (float)H, [this, n]() {
+                        prev_shot = shot;
+                        shot = (shot + 1) % n;
+                        shot_time = now_ms();
+                    }});
+    hits.push_back({W / 3.0f, 0, W / 3.0f, (float)H, [this]() { viewer = false; }});
 }
 
 void App::go_back()
@@ -1575,6 +1645,8 @@ void App::draw_footer()
         if (has_saves)
             x = gfx::hint(x, y, BTN_R, "Сохранения");
         x = gfx::hint(x, y, back_icon, "Назад");
+        if (!detail.shots.empty())
+            x = gfx::hint(x, y, BTN_SELECT, "Скриншоты");
         if (!related.empty())
             gfx::text(gfx::regular, x, y + 15, 14, col::MUTED, "↓ связанное");
         else if (detail.shots.size() > 1)
@@ -1660,6 +1732,10 @@ void App::draw()
         else
             draw_grid();
         draw_header();
+    } else if (screen == SCR_DETAIL && viewer) {
+        draw_viewer();
+        draw_toast();
+        return;
     } else if (screen == SCR_DETAIL) {
         draw_detail();
     } else if (screen == SCR_BACKUPS) {
