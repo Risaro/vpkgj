@@ -678,7 +678,7 @@ void App::start_refresh(bool manual)
         return;
     manual_refresh = manual;
     refreshing = 1;
-    SceUID th = sceKernelCreateThread("vpkgj_refresh", refresh_thread, 0x10000100, 128 * 1024, 0, 0, nullptr);
+    SceUID th = sceKernelCreateThread("vpkgj_refresh", refresh_thread, 180, 128 * 1024, 0, 0, nullptr);
     App* self = this;
     sceKernelStartThread(th, sizeof(self), &self);
 }

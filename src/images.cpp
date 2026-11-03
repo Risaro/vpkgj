@@ -24,7 +24,7 @@ void Images::start()
     fs::mkdirs(CACHE);
     Images* self = this;
     for (int i = 0; i < 3; i++) {
-        SceUID th = sceKernelCreateThread("vpkgj_images", worker, 0x10000100, 256 * 1024, 0, 0, nullptr);
+        SceUID th = sceKernelCreateThread("vpkgj_images", worker, 191, 256 * 1024, 0, 0, nullptr);
         sceKernelStartThread(th, sizeof(self), &self);
         threads.push_back(th);
     }
