@@ -14,6 +14,8 @@
 #include <psp2/appmgr.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/notificationutil.h>
+#include <psp2/sysmodule.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/power.h>
 #include <psp2/system_param.h>
@@ -160,6 +162,10 @@ struct App {
     void rebuild();
     std::vector<Entry> deps_of(const Entry& e);
     std::string icon_url(const Entry& e);
+    Status status_of(const Entry& e);
+    std::vector<Entry> collect_updates();
+    void notify_updates();
+    int updates_count = 0;
     std::vector<Entry>& list(int c) { return catalog.items[c]; }
     const Entry* selected();
     void open_detail(const Entry& e);
@@ -264,6 +270,84 @@ void App::check_deps()
         detail_dep_ok.push_back(plugin_present(d));
 }
 
+Status App::status_of(const Entry& e)
+{
+    if (catalog.patch_for(e))
+        return ST_UPDATE;
+    return installed.status(e);
+}
+
+std::vector<Entry> App::collect_updates()
+{
+    std::vector<Entry> out;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        if (c == CAT_GAMES)
+            continue;
+        for (auto& e : catalog.items[c])
+            if (installed.status(e) == ST_UPDATE)
+                out.push_back(e);
+    }
+    for (auto& kv : catalog.game_versions) {
+        auto p = catalog.patches.find(kv.first);
+        if (p != catalog.patches.end() && version_cmp(kv.second, p->second.version) < 0)
+            out.push_back(p->second);
+    }
+    return out;
+}
+
+static void system_notify(const std::string& text)
+{
+    static bool loaded = false;
+    if (!loaded) {
+        sceSysmoduleLoadModule(SCE_SYSMODULE_NOTIFICATION_UTIL);
+        loaded = true;
+    }
+    SceWChar16 buf[SCE_NOTIFICATIONUTIL_TEXT_MAX + 1];
+    memset(buf, 0, sizeof(buf));
+    size_t n = 0, i = 0;
+    while (i < text.size() && n < SCE_NOTIFICATIONUTIL_TEXT_MAX - 1) {
+        unsigned char c = text[i];
+        uint32_t cp = c;
+        if (c >= 0xe0 && i + 2 < text.size()) {
+            cp = ((c & 0x0f) << 12) | ((text[i + 1] & 0x3f) << 6) | (text[i + 2] & 0x3f);
+            i += 3;
+        } else if (c >= 0xc0 && i + 1 < text.size()) {
+            cp = ((c & 0x1f) << 6) | (text[i + 1] & 0x3f);
+            i += 2;
+        } else {
+            i += 1;
+        }
+        buf[n++] = (SceWChar16)cp;
+    }
+    sceNotificationUtilSendNotification(buf);
+}
+
+void App::notify_updates()
+{
+    auto ups = collect_updates();
+    updates_count = (int)ups.size();
+    if (ups.empty())
+        return;
+    std::string seen;
+    fs::read(APP_DIR + "/notified.txt", seen);
+    std::string add;
+    int sent = 0;
+    for (auto& u : ups) {
+        std::string key = std::string(category_key(u.cat)) + "/" + u.id + "/" + u.version + "\n";
+        if (seen.find(key) != std::string::npos)
+            continue;
+        add += key;
+        if (sent < 3)
+            system_notify("Обновление: " + u.name + " " + u.version);
+        sent++;
+    }
+    if (sent > 3)
+        system_notify("И ещё обновлений: " + std::to_string(sent - 3));
+    if (!add.empty())
+        fs::write(APP_DIR + "/notified.txt", seen + add);
+    show_toast("Доступно обновлений: " + std::to_string(updates_count) + ", смотри вкладку Загрузки");
+}
+
 const Entry* App::selected()
 {
     if (tab >= CAT_COUNT || filtered[tab].empty())
@@ -290,6 +374,7 @@ int App::refresh_thread(unsigned int, void* arg)
         fs::write(APP_DIR + "/covers.json", covers);
     c->load_pkgj();
     c->apply_covers();
+    c->load_updates();
     {
         std::lock_guard<std::mutex> lock(a->refresh_m);
         a->fresh = std::move(c);
@@ -322,6 +407,7 @@ void App::apply_refresh()
         fresh.reset();
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
+        notify_updates();
         if (!refresh_err.empty()) {
             if (manual_refresh || !loaded_once)
                 show_toast("Не удалось обновить каталог: " + refresh_err);
@@ -556,9 +642,13 @@ void App::primary_action()
         show_toast(plugin_present(e) ? e.name + " уже на месте" : e.description);
         return;
     }
-    Status st = installed.status(e);
+    Status st = status_of(e);
     if (st == ST_INSTALLED && launchable(e)) {
         launch(e);
+        return;
+    }
+    if (const Entry* p = catalog.patch_for(e)) {
+        ask_install(*p, false);
         return;
     }
     ask_install(e, st == ST_INSTALLED);
@@ -712,6 +802,12 @@ void App::input()
         }
         if (tab == TAB_DOWNLOADS) {
             auto list = tasks.list();
+            if ((pressed & SCE_CTRL_SQUARE) && updates_count) {
+                auto ups = collect_updates();
+                for (auto& u : ups)
+                    tasks.add(u, deps_of(u));
+                show_toast("В очередь добавлено обновлений: " + std::to_string(ups.size()));
+            }
             if (act & SCE_CTRL_UP)
                 dl_sel = std::max(0, dl_sel - 1);
             if (act & SCE_CTRL_DOWN)
@@ -1005,7 +1101,7 @@ void App::draw_card(const Entry& e, float x, float y)
 
     float bx = x + CARD_W - 8;
     auto t = tasks.find(e);
-    Status st = installed.status(e);
+    Status st = status_of(e);
     if (t && t->state == TS_RUNNING) {
         uint64_t total = t->progress.total, done = t->progress.done;
         std::string s = total ? std::to_string((int)(done * 100 / total)) + "%" : "...";
@@ -1194,7 +1290,7 @@ void App::draw_detail()
     gfx::text(gfx::regular, tx, HERO - 8, 14, col::MUTED, gfx::ellipsize(gfx::regular, 14, meta, (int)(bx - tx - 20)));
 
     auto t = tasks.find(e);
-    Status st = installed.status(e);
+    Status st = status_of(e);
     bool busy = t && (t->state == TS_RUNNING || t->state == TS_QUEUED);
     if (busy) {
         gfx::rrect(bx, by, bw, 50, 25, col::SURFACE2);
@@ -1216,7 +1312,7 @@ void App::draw_detail()
             label = "Переустановить";
             bg = col::SURFACE2;
         } else if (st == ST_UPDATE)
-            label = "Обновить";
+            label = catalog.patch_for(e) ? "Обновить до " + catalog.patch_for(e)->version : "Обновить";
         else
             label = e.size ? "Установить · " + fmt_size(e.size) : "Установить";
         if (st == ST_UPDATE)
@@ -1262,8 +1358,8 @@ void App::draw_detail()
         chip("Есть обновление", col::ORANGE);
     if (t && t->state == TS_FAILED)
         chip(gfx::ellipsize(gfx::regular, 13, "Ошибка: " + t->get_error(), 520), col::RED);
-    if (t && t->state == TS_DONE && !t->note.empty())
-        chip(t->note, col::ORANGE);
+    if (t && t->state == TS_DONE && !t->get_note().empty())
+        chip(t->get_note(), col::ORANGE);
 
     float top = HERO + 54, bottom = related.empty() ? FOOTER_Y - 6 : FOOTER_Y - 112;
     float lh = 22;
@@ -1333,6 +1429,16 @@ void App::check_reboot()
     if (modal.on)
         return;
     for (auto& t : tasks.list()) {
+        if (t->state == TS_DONE && !t->synced) {
+            t->synced = true;
+            if (t->entry.cat == CAT_GAMES) {
+                catalog.load_updates();
+                updates_count = (int)collect_updates().size();
+            } else {
+                installed.refresh();
+                updates_count = (int)collect_updates().size();
+            }
+        }
         if (t->state == TS_DONE && t->reboot && !t->notified) {
             t->notified = true;
             modal = Modal();
@@ -1490,6 +1596,13 @@ void App::draw_related()
 void App::draw_downloads()
 {
     auto list = tasks.list();
+    if (updates_count) {
+        std::string u = "Доступно обновлений: " + std::to_string(updates_count);
+        gfx::rrect(W - 28 - 330, GRID_TOP, 330, 34, 17, gfx::alpha(col::ORANGE, 0.18f));
+        gfx::text(gfx::bold, W - 28 - 316, GRID_TOP + 22, 14, col::ORANGE, u);
+        gfx::button(BTN_SQUARE, W - 28 - 110, GRID_TOP + 7, 20);
+        gfx::text(gfx::regular, W - 28 - 84, GRID_TOP + 22, 13, col::TEXT, "обновить всё");
+    }
     if (list.empty()) {
         gfx::text_center(gfx::bold, W / 2, 270, 20, col::TEXT, "Загрузок нет");
         gfx::text_center(gfx::regular, W / 2, 298, 15, col::MUTED, "Выбери игру или порт и нажми Установить");
@@ -1537,7 +1650,7 @@ void App::draw_downloads()
         } else if (st == TS_QUEUED) {
             status = "В очереди";
         } else if (st == TS_DONE) {
-            status = t->note.empty() ? "Установлено" : "Установлено. " + t->note;
+            status = t->get_note().empty() ? "Установлено" : "Установлено. " + t->get_note();
             sc = col::GREEN;
         } else if (st == TS_CANCELED) {
             status = "Отменено";
@@ -1626,6 +1739,8 @@ void App::draw_footer()
         gfx::hint(x, y, BTN_START, "Настройки");
     } else if (screen == SCR_BROWSE) {
         x = gfx::hint(x, y, ok_icon, "Отменить или повторить");
+        if (updates_count)
+            x = gfx::hint(x, y, BTN_SQUARE, "Обновить всё");
         x = gfx::hint(x, y, BTN_TRIANGLE, "Очистить готовые");
         gfx::hint(x, y, BTN_START, "Настройки");
     } else if (screen == SCR_DETAIL && rel_sel >= 0) {
@@ -1769,6 +1884,7 @@ void App::run()
         catalog.media = settings.base() + "media/";
     catalog.load_pkgj();
     catalog.apply_covers();
+    catalog.load_updates();
     rebuild();
     images.start();
     tasks.start(&installed);

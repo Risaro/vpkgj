@@ -14,6 +14,8 @@
 
 enum { IMG_PENDING, IMG_LOADING, IMG_READY, IMG_FAILED };
 
+static std::mutex gpu_lock;
+
 static const size_t BUDGET = 40u * 1024 * 1024;
 #define CACHE (APP_DIR + "/cache")
 
@@ -127,6 +129,7 @@ void Images::tick()
     }
     if (!victims.empty()) {
         vita2d_wait_rendering_done();
+        std::lock_guard<std::mutex> g(gpu_lock);
         for (auto t : victims)
             vita2d_free_texture(t);
     }
@@ -140,6 +143,7 @@ void Images::clear_disk()
 
 static vita2d_texture* decode_jpeg(const uint8_t* data, size_t size)
 {
+    std::lock_guard<std::mutex> g(gpu_lock);
     tjhandle h = tjInitDecompress();
     if (!h)
         return nullptr;
@@ -178,6 +182,7 @@ static vita2d_texture* load_file(const std::string& path)
     const uint8_t* b = (const uint8_t*)data.data();
     if (b[0] == 0xFF && b[1] == 0xD8)
         return decode_jpeg(b, data.size());
+    std::lock_guard<std::mutex> g(gpu_lock);
     if (b[0] == 0x89 && b[1] == 'P')
         return vita2d_load_PNG_buffer(b);
     if (b[0] == 'B' && b[1] == 'M')
@@ -225,8 +230,10 @@ static vita2d_texture* load_pak(const std::string& name)
     }
     if (buf[0] == 0xFF && buf[1] == 0xD8)
         return decode_jpeg(buf.data(), buf.size());
-    if (buf[0] == 0x89 && buf[1] == 'P')
+    if (buf[0] == 0x89 && buf[1] == 'P') {
+        std::lock_guard<std::mutex> g(gpu_lock);
         return vita2d_load_PNG_buffer(buf.data());
+    }
     return nullptr;
 }
 

@@ -59,6 +59,10 @@ public:
     bool parse(const std::string& json, std::string& err);
     void load_pkgj();
     void apply_covers();
+    void load_updates();
+    const Entry* patch_for(const Entry& e) const;
+    std::map<std::string, Entry> patches;
+    std::map<std::string, std::string> game_versions;
     std::string media_url(const std::string& path) const;
 };
 
@@ -81,6 +85,7 @@ private:
 std::string pkgj_config_path();
 bool pkgj_urls(std::string& games, std::string& dlcs);
 void pkgj_fetch(bool force);
+int version_cmp(const std::string& a, const std::string& b);
 
 const char* category_key(Category c);
 const char* category_title(Category c);

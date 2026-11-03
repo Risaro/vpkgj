@@ -20,6 +20,12 @@ std::string Task::get_stage()
     return stage;
 }
 
+std::string Task::get_note()
+{
+    std::lock_guard<std::mutex> lock(m);
+    return note;
+}
+
 std::string Task::get_error()
 {
     std::lock_guard<std::mutex> lock(m);

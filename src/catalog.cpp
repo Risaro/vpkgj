@@ -1,11 +1,13 @@
 #include "catalog.hpp"
 
 #include "net.hpp"
+#include "promote.hpp"
 #include "util.hpp"
 
 #include <json/json.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <sstream>
 
@@ -153,6 +155,8 @@ std::string pkgj_config_path()
     return "";
 }
 
+static std::string pkgj_updates_url;
+
 bool pkgj_urls(std::string& games, std::string& dlcs)
 {
     std::string path = pkgj_config_path();
@@ -170,12 +174,15 @@ bool pkgj_urls(std::string& games, std::string& dlcs)
             games = v;
         else if (k == "url_dlcs" && !v.empty())
             dlcs = v;
+        else if (k == "url_updates" && !v.empty())
+            pkgj_updates_url = v;
     }
     return !games.empty() || !dlcs.empty();
 }
 
 #define PKGJ_GAMES (APP_DIR + "/pkgj_games.tsv")
 #define PKGJ_DLCS (APP_DIR + "/pkgj_dlcs.tsv")
+#define PKGJ_UPDATES (APP_DIR + "/pkgj_updates.tsv")
 
 void pkgj_fetch(bool force)
 {
@@ -189,6 +196,9 @@ void pkgj_fetch(bool force)
     if (!dlcs.empty() && (force || !fs::exists(PKGJ_DLCS)))
         if (!net::fetch(dlcs, PKGJ_DLCS, nullptr, err))
             log_line("pkgj dlcs list: %s", err.c_str());
+    if (!pkgj_updates_url.empty())
+        if (!net::fetch(pkgj_updates_url, PKGJ_UPDATES, nullptr, err))
+            log_line("pkgj updates list: %s", err.c_str());
 }
 
 static std::vector<std::string> split_tab(const std::string& line)
@@ -276,6 +286,77 @@ void Catalog::apply_covers()
         if (e.description.empty())
             e.description = str(v, "d");
     }
+}
+
+int version_cmp(const std::string& a, const std::string& b)
+{
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        long x = 0, y = 0;
+        while (i < a.size() && !isdigit((unsigned char)a[i]))
+            i++;
+        while (i < a.size() && isdigit((unsigned char)a[i]))
+            x = x * 10 + (a[i++] - '0');
+        while (j < b.size() && !isdigit((unsigned char)b[j]))
+            j++;
+        while (j < b.size() && isdigit((unsigned char)b[j]))
+            y = y * 10 + (b[j++] - '0');
+        if (x != y)
+            return x < y ? -1 : 1;
+    }
+    return 0;
+}
+
+void Catalog::load_updates()
+{
+    patches.clear();
+    game_versions.clear();
+    std::string text;
+    if (fs::read(PKGJ_UPDATES, text)) {
+        size_t pos = text.find('\n');
+        while (pos != std::string::npos && pos + 1 < text.size()) {
+            size_t end = text.find('\n', pos + 1);
+            std::string line = text.substr(pos + 1, end == std::string::npos ? std::string::npos : end - pos - 1);
+            pos = end;
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            auto f = split_tab(line);
+            if (f.size() < 9 || f[0].size() != 9 || f[5].empty() || f[5] == "MISSING")
+                continue;
+            auto it = patches.find(f[0]);
+            if (it != patches.end() && version_cmp(it->second.version, f[3]) >= 0)
+                continue;
+            Entry e;
+            e.cat = CAT_GAMES;
+            e.id = f[0];
+            e.region = f[1];
+            e.name = "Обновление " + f[2];
+            e.version = f[3];
+            e.url = f[5];
+            e.size = strtoull(f[7].c_str(), nullptr, 10);
+            e.sha256 = f[8].size() == 64 ? f[8] : "";
+            e.install = "patch";
+            patches[f[0]] = e;
+        }
+    }
+    for (auto& id : fs::list("ux0:app")) {
+        if (id.size() != 9 || !patches.count(id))
+            continue;
+        std::string v;
+        if (sfo_get("ux0:patch/" + id + "/sce_sys/param.sfo", "APP_VER", v) || sfo_get("ux0:app/" + id + "/sce_sys/param.sfo", "APP_VER", v))
+            game_versions[id] = v;
+    }
+}
+
+const Entry* Catalog::patch_for(const Entry& e) const
+{
+    if (e.cat != CAT_GAMES || e.dlc || e.install == "patch")
+        return nullptr;
+    auto v = game_versions.find(e.id);
+    auto p = patches.find(e.id);
+    if (v == game_versions.end() || p == patches.end())
+        return nullptr;
+    return version_cmp(v->second, p->second.version) < 0 ? &p->second : nullptr;
 }
 
 void Catalog::load_pkgj()

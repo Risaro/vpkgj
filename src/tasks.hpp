@@ -25,9 +25,11 @@ struct Task {
     double speed = 0;
     bool reboot = false;
     bool notified = false;
+    bool synced = false;
 
     std::string get_stage();
     std::string get_error();
+    std::string get_note();
     void set_stage(const std::string& s);
 };
 
