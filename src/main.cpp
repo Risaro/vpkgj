@@ -111,6 +111,9 @@ struct App {
     void open_backups();
     void saves_menu(const Entry& e);
     void check_reboot();
+    bool daemon_enabled();
+    void toggle_daemon();
+    int daemon_state = -1;
     int dl_sel = 0;
 
     float fx = 0, fy = 0, fw = 0, fh = 0;
@@ -990,7 +993,7 @@ void App::input()
         if (act & SCE_CTRL_UP)
             settings_sel = std::max(0, settings_sel - 1);
         if (act & SCE_CTRL_DOWN)
-            settings_sel = std::min(5, settings_sel + 1);
+            settings_sel = std::min(6, settings_sel + 1);
         if (pressed & (back_btn | SCE_CTRL_START | SCE_CTRL_SELECT)) {
             screen = SCR_BROWSE;
             return;
@@ -1025,6 +1028,9 @@ void App::input()
                 break;
             case 5:
                 open_backups();
+                break;
+            case 6:
+                toggle_daemon();
                 break;
             }
         }
@@ -1424,6 +1430,56 @@ void App::saves_menu(const Entry& e)
     }
 }
 
+#define DAEMON_PATH (APP_DIR + "/vpkgj_daemon.suprx")
+
+bool App::daemon_enabled()
+{
+    if (daemon_state < 0) {
+        std::string a, b;
+        fs::read("ux0:tai/config.txt", a);
+        fs::read("ur0:tai/config.txt", b);
+        daemon_state = (a + b).find("vpkgj_daemon.suprx") != std::string::npos && !fs::exists(APP_DIR + "/daemon_off");
+    }
+    return daemon_state == 1;
+}
+
+void App::toggle_daemon()
+{
+    std::string err;
+    backup_create("Перед переключением фоновой проверки: config.txt", {"ux0:tai/config.txt", "ur0:tai/config.txt"}, err);
+    if (daemon_enabled()) {
+        fs::write(APP_DIR + "/daemon_off", "1");
+        tai_remove_plugin(DAEMON_PATH);
+        daemon_state = 0;
+        show_toast("Фоновая проверка выключена");
+        return;
+    }
+    std::string data;
+    if (!fs::read("app0:vpkgj_daemon.suprx", data) || !fs::write(DAEMON_PATH, data)) {
+        show_toast("Не удалось скопировать демон");
+        return;
+    }
+    sceIoRemove((APP_DIR + "/daemon_off").c_str());
+    if (!tai_add_plugin("*main", DAEMON_PATH, err)) {
+        show_toast(err);
+        return;
+    }
+    daemon_state = 1;
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Фоновая проверка включена";
+    modal.lines.push_back("Раз в 6 часов консоль сама проверит каталог и патчи игр,");
+    modal.lines.push_back("даже когда VPKGJ закрыт, и пришлёт уведомление на LiveArea.");
+    modal.lines.push_back("Работает на прошивках 3.60 и 3.65. Включится после перезагрузки.");
+    modal.yes = "Перезагрузить";
+    modal.action = [this]() {
+        if (tasks.active())
+            show_toast("Дождись окончания загрузок");
+        else
+            scePowerRequestColdReset();
+    };
+}
+
 void App::check_reboot()
 {
     if (modal.on)
@@ -1686,23 +1742,26 @@ void App::draw_settings()
         {"Очистить кеш картинок", ""},
         {"Удалить временные файлы загрузок", ""},
         {"Резервные копии", "config.txt, rePatch, сохранения"},
+        {"Фоновая проверка обновлений", daemon_enabled() ? "включена" : "выключена"},
     };
     std::string pc = pkgj_config_path();
     float y = 76;
     for (int i = 0; i < (int)rows.size(); i++) {
         bool on = i == settings_sel;
-        gfx::rrect(28, y, W - 56, 48, 12, on ? col::SURFACE2 : col::SURFACE);
+        gfx::rrect(28, y, W - 56, 44, 12, on ? col::SURFACE2 : col::SURFACE);
         if (on)
-            gfx::rframe(28, y, W - 56, 48, 12, 2, col::ACCENT);
-        gfx::text(gfx::regular, 48, y + 30, 16, col::TEXT, rows[i].title);
-        gfx::text_right(gfx::regular, W - 48, y + 30, 15, col::MUTED, rows[i].value);
+            gfx::rframe(28, y, W - 56, 44, 12, 2, col::ACCENT);
+        gfx::text(gfx::regular, 48, y + 28, 16, col::TEXT, rows[i].title);
+        gfx::text_right(gfx::regular, W - 48, y + 28, 15, col::MUTED, rows[i].value);
         int idx = i;
-        hits.push_back({28, y, (float)(W - 56), 48, [this, idx]() {
+        hits.push_back({28, y, (float)(W - 56), 44, [this, idx]() {
                             if (settings_sel == idx && idx == 5)
                                 open_backups();
+                            if (settings_sel == idx && idx == 6)
+                                toggle_daemon();
                             settings_sel = idx;
                         }});
-        y += 54;
+        y += 50;
     }
     y += 8;
     std::vector<std::string> about = {
@@ -1886,6 +1945,11 @@ void App::run()
     catalog.apply_covers();
     catalog.load_updates();
     rebuild();
+    if (fs::exists(DAEMON_PATH)) {
+        std::string a, b;
+        if (fs::read("app0:vpkgj_daemon.suprx", a) && fs::read(DAEMON_PATH, b) && a != b)
+            fs::write(DAEMON_PATH, a);
+    }
     images.start();
     tasks.start(&installed);
     start_refresh(false);

@@ -339,13 +339,20 @@ void Catalog::load_updates()
             patches[f[0]] = e;
         }
     }
+    std::string out;
     for (auto& id : fs::list("ux0:app")) {
         if (id.size() != 9 || !patches.count(id))
             continue;
         std::string v;
-        if (sfo_get("ux0:patch/" + id + "/sce_sys/param.sfo", "APP_VER", v) || sfo_get("ux0:app/" + id + "/sce_sys/param.sfo", "APP_VER", v))
+        if (sfo_get("ux0:patch/" + id + "/sce_sys/param.sfo", "APP_VER", v) || sfo_get("ux0:app/" + id + "/sce_sys/param.sfo", "APP_VER", v)) {
             game_versions[id] = v;
+            out += id + "\t" + v + "\n";
+        }
     }
+    std::string old;
+    fs::read(APP_DIR + "/game_versions.txt", old);
+    if (old != out)
+        fs::write(APP_DIR + "/game_versions.txt", out);
 }
 
 const Entry* Catalog::patch_for(const Entry& e) const

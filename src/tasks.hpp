@@ -55,3 +55,5 @@ private:
 
 std::string tai_dir();
 bool plugin_present(const Entry& plugin);
+bool tai_add_plugin(const std::string& section, const std::string& path, std::string& err);
+bool tai_remove_plugin(const std::string& path);

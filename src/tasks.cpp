@@ -160,6 +160,34 @@ static std::vector<std::string> split(const std::string& s, char sep)
     return out;
 }
 
+bool tai_add_plugin(const std::string& section, const std::string& path, std::string& err)
+{
+    return tai_add(section, path, err);
+}
+
+bool tai_remove_plugin(const std::string& path)
+{
+    bool changed = false;
+    for (const char* cfg : {"ux0:tai/config.txt", "ur0:tai/config.txt"}) {
+        std::string text;
+        if (!fs::read(cfg, text) || lower(text).find(lower(path)) == std::string::npos)
+            continue;
+        std::istringstream in(text);
+        std::string line, out;
+        while (std::getline(in, line)) {
+            std::string l = line;
+            if (!l.empty() && l.back() == '\r')
+                l.pop_back();
+            if (lower(trim(l)) == lower(path))
+                continue;
+            out += l + "\n";
+        }
+        fs::write(cfg, out);
+        changed = true;
+    }
+    return changed;
+}
+
 static std::string base_name(const std::string& p)
 {
     size_t s = p.rfind('/');

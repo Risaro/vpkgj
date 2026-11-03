@@ -89,6 +89,26 @@ target_link_libraries(vpkgj
 
 vita_create_self(eboot.bin vpkgj UNSAFE)
 
+add_executable(vpkgj_daemon daemon/main.c)
+target_link_libraries(vpkgj_daemon
+  taihen_stub
+  taipool
+  k
+  gcc
+  SceLibKernel_stub_weak
+  SceKernelThreadMgr_stub
+  SceKernelModulemgr_stub
+  SceSysmodule_stub
+  SceNet_stub_weak
+  SceNetCtl_stub_weak
+  SceHttp_stub_weak
+  SceSsl_stub_weak
+  SceIofilemgr_stub
+  SceLibc_stub_weak
+)
+set_target_properties(vpkgj_daemon PROPERTIES LINK_FLAGS "-nostdlib")
+vita_create_self(vpkgj_daemon.suprx vpkgj_daemon UNSAFE CONFIG ${CMAKE_SOURCE_DIR}/daemon/exports.yml)
+
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
   VERSION ${VITA_VERSION}
   NAME ${VITA_APP_NAME}
@@ -98,6 +118,7 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
        sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
        assets/Inter-Regular.ttf assets/Inter-Regular.ttf
        assets/Inter-SemiBold.ttf assets/Inter-SemiBold.ttf
+       ${CMAKE_BINARY_DIR}/vpkgj_daemon.suprx vpkgj_daemon.suprx
 )
 
 set(VPKGJ_COVERS "${CMAKE_SOURCE_DIR}/../db" CACHE PATH "vpkgj-db checkout with media/covers and covers.json")

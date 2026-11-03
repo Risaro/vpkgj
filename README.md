@@ -7,6 +7,8 @@
 - Вкладки: Игры, Порты, Переводы, Хоумбрю, Плагины, Загрузки.
 - Игры и DLC берутся из тех же списков, что у pkgj: приложение читает `ux0:pkgj/config.txt` (`url_games`, `url_dlcs`). Обложки, скриншоты и описания к ним лежат в каталоге.
 - Фоновая загрузка игр через системную очередь Vita, как в pkgj: приложение можно закрыть, игра поставится из уведомлений.
+- Обновления: при запуске VPKGJ сравнивает установленное с каталогом и патчи игр со списком `url_updates` из конфига pkgj, присылает системное уведомление и даёт обновить всё одной кнопкой во вкладке Загрузки.
+- Фоновая проверка (Настройки): демон `vpkgj_daemon.suprx` в `*main` раз в 6 часов проверяет обновления, даже когда приложение закрыто, и показывает уведомление на LiveArea. Работает на 3.60 и 3.65.
 - Зависимости: перед установкой перевода или порта проверяется, стоят ли нужные плагины (rePatch, kubridge, fd_fix и другие). Если нет, они ставятся сами.
 - Сетка карточек с обложками, карточка игры со скриншотами, описанием и размером.
 - Поиск по названию, titleid и автору.
@@ -56,7 +58,7 @@
 Нужен [VitaSDK](https://vitasdk.org) и пакеты:
 
 ```
-vdpm libvita2d curl-mbedtls jsoncpp minizip libpng libjpeg-turbo freetype zlib
+vdpm libvita2d curl-mbedtls jsoncpp minizip libpng libjpeg-turbo freetype zlib taipool libk
 cmake -S . -B build
 cmake --build build
 ```
@@ -69,4 +71,5 @@ GPL-3.0. Шрифт Inter, лицензия OFL (`assets/Inter-LICENSE.txt`).
 
 - Распаковка PKG, zRIF и системная фоновая загрузка по устройству [pkgj](https://github.com/blastrock/pkgj) (фоновая загрузка: dots-tb и команда NPS).
 - Обложки и описания игр: база [LaunchBox Games Database](https://gamesdb.launchbox-app.com).
+- Уведомления на LiveArea из демона по образцу VitaDB Downloader и [SceShell-Notice-PoC](https://github.com/Princess-of-Sleeping/SceShell-Notice-PoC).
 - Генерация `head.bin` для установки vpk по образцу [VitaShell](https://github.com/TheOfficialFloW/VitaShell), VHBB и [VitaDB Downloader](https://github.com/Rinnegatamante/VitaDB-Downloader).
