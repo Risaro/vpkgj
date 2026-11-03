@@ -252,7 +252,7 @@ static int load_nps(std::vector<Entry>& out, const std::string& path, bool dlc)
 void Catalog::apply_covers()
 {
     std::string text;
-    bool bundled = fs::exists("app0:covers.json");
+    bool bundled = fs::exists("app0:covers.pak");
     if (!fs::read(APP_DIR + "/covers.json", text) && !fs::read("app0:covers.json", text))
         return;
     Json::CharReaderBuilder b;
@@ -267,7 +267,7 @@ void Catalog::apply_covers()
             continue;
         if (e.icon.empty()) {
             std::string c = str(v, "c");
-            e.icon = bundled && starts_with(c, "covers/") ? "app0:" + c : c;
+            e.icon = bundled && starts_with(c, "covers/") ? "pak:" + c : c;
         }
         if (e.shots.empty() && v["s"].isArray())
             for (const auto& s : v["s"])

@@ -105,6 +105,6 @@ if(EXISTS "${VPKGJ_COVERS}/covers.json" AND EXISTS "${VPKGJ_COVERS}/media/covers
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bundle/covers"
     COMMAND ${CMAKE_COMMAND} -E copy "${VPKGJ_COVERS}/covers.json" "${CMAKE_BINARY_DIR}/bundle/covers.json"
     COMMAND sh -c "cd '${VPKGJ_COVERS}/media' && find covers -name c.jpg | while read f; do mkdir -p '${CMAKE_BINARY_DIR}/bundle/'$(dirname $f) && cp $f '${CMAKE_BINARY_DIR}/bundle/'$f; done"
-    COMMAND sh -c "cd '${CMAKE_BINARY_DIR}/bundle' && zip -q -0 -r '${CMAKE_BINARY_DIR}/${PROJECT_NAME}.vpk' covers covers.json"
+    COMMAND sh -c "cd '${CMAKE_BINARY_DIR}/bundle' && rm -f covers.pak && zip -q -0 -r covers.pak covers && zip -q -0 '${CMAKE_BINARY_DIR}/${PROJECT_NAME}.vpk' covers.pak covers.json"
     VERBATIM)
 endif()

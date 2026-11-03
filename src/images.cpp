@@ -6,7 +6,10 @@
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include <minizip/unzip.h>
+
 #include <algorithm>
+#include <vector>
 
 enum { IMG_PENDING, IMG_LOADING, IMG_READY, IMG_FAILED };
 
@@ -114,8 +117,57 @@ void Images::clear_disk()
     fs::mkdirs(CACHE);
 }
 
+static vita2d_texture* load_pak(const std::string& name)
+{
+    static unzFile pak = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        pak = unzOpen64("app0:covers.pak");
+    }
+    if (!pak || unzLocateFile(pak, name.c_str(), 0) != UNZ_OK)
+        return nullptr;
+    unz_file_info64 info;
+    if (unzGetCurrentFileInfo64(pak, &info, nullptr, 0, nullptr, 0, nullptr, 0) != UNZ_OK || info.uncompressed_size > 8u * 1024 * 1024)
+        return nullptr;
+    if (unzOpenCurrentFile(pak) != UNZ_OK)
+        return nullptr;
+    std::vector<uint8_t> buf(info.uncompressed_size);
+    int r = unzReadCurrentFile(pak, buf.data(), buf.size());
+    unzCloseCurrentFile(pak);
+    if (r != (int)buf.size() || buf.size() < 4)
+        return nullptr;
+    if (buf[0] == 0xFF && buf[1] == 0xD8)
+        return vita2d_load_JPEG_buffer(buf.data(), buf.size());
+    if (buf[0] == 0x89 && buf[1] == 'P')
+        return vita2d_load_PNG_buffer(buf.data());
+    return nullptr;
+}
+
 void Images::load(const std::string& url)
 {
+    if (starts_with(url, "pak:")) {
+        vita2d_texture* tex = load_pak(url.substr(4));
+        if (tex)
+            vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+        std::lock_guard<std::mutex> lock(m);
+        auto it = cache.find(url);
+        if (it == cache.end()) {
+            if (tex)
+                to_free.push_back(tex);
+            return;
+        }
+        if (!tex) {
+            it->second.state = IMG_FAILED;
+            return;
+        }
+        it->second.tex = tex;
+        it->second.bytes = vita2d_texture_get_stride(tex) * vita2d_texture_get_height(tex);
+        it->second.ready_at = now_ms();
+        it->second.state = IMG_READY;
+        total += it->second.bytes;
+        return;
+    }
     bool local = !starts_with(url, "http://") && !starts_with(url, "https://");
     std::string path = local ? url : CACHE + "/" + hash_name(url);
     if (!local && !fs::exists(path)) {
