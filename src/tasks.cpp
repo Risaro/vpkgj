@@ -423,7 +423,7 @@ std::shared_ptr<Task> Tasks::add(const Entry& e)
 {
     std::lock_guard<std::mutex> lock(m);
     for (auto& t : tasks)
-        if (t->entry.cat == e.cat && t->entry.id == e.id && t->entry.region == e.region &&
+        if (t->entry.cat == e.cat && t->entry.id == e.id && t->entry.region == e.region && t->entry.content == e.content &&
             (t->state == TS_QUEUED || t->state == TS_RUNNING))
             return t;
     auto t = std::make_shared<Task>();
@@ -437,7 +437,8 @@ std::shared_ptr<Task> Tasks::find(const Entry& e)
 {
     std::lock_guard<std::mutex> lock(m);
     for (auto it = tasks.rbegin(); it != tasks.rend(); ++it)
-        if ((*it)->entry.cat == e.cat && (*it)->entry.id == e.id && (*it)->entry.region == e.region)
+        if ((*it)->entry.cat == e.cat && (*it)->entry.id == e.id && (*it)->entry.region == e.region &&
+            (*it)->entry.content == e.content)
             return *it;
     return nullptr;
 }

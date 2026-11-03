@@ -1,9 +1,12 @@
 #include "catalog.hpp"
 
+#include "net.hpp"
 #include "util.hpp"
 
 #include <json/json.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <sstream>
 
 const char* category_key(Category c)
@@ -97,6 +100,7 @@ bool Catalog::parse(const std::string& json, std::string& err)
             e.mirror = str(v, "mirror");
             e.zrif = str(v, "zrif");
             e.sha256 = str(v, "sha256");
+            e.content = str(v, "content_id");
             e.size = v["size"].isNumeric() ? v["size"].asUInt64() : 0;
             e.icon = str(v, "icon");
             if (v["shots"].isArray())
@@ -133,7 +137,123 @@ std::string Catalog::media_url(const std::string& path) const
 
 static std::string key(const Entry& e)
 {
-    return std::string(category_key(e.cat)) + "/" + e.id;
+    std::string k = std::string(category_key(e.cat)) + "/" + e.id;
+    if (e.dlc)
+        k += "/" + e.content;
+    return k;
+}
+
+std::string pkgj_config_path()
+{
+    for (const char* p : {"ux0:pkgj/config.txt", "ur0:pkgj/config.txt"})
+        if (fs::exists(p))
+            return p;
+    return "";
+}
+
+bool pkgj_urls(std::string& games, std::string& dlcs)
+{
+    std::string path = pkgj_config_path();
+    std::string text;
+    if (path.empty() || !fs::read(path, text))
+        return false;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream ls(line);
+        std::string k, v;
+        ls >> k >> v;
+        k = lower(k);
+        if ((k == "url" || k == "url_games") && !v.empty())
+            games = v;
+        else if (k == "url_dlcs" && !v.empty())
+            dlcs = v;
+    }
+    return !games.empty() || !dlcs.empty();
+}
+
+static const std::string PKGJ_GAMES = APP_DIR + "/pkgj_games.tsv";
+static const std::string PKGJ_DLCS = APP_DIR + "/pkgj_dlcs.tsv";
+
+void pkgj_fetch(bool force)
+{
+    std::string games, dlcs;
+    if (!pkgj_urls(games, dlcs))
+        return;
+    std::string err;
+    if (!games.empty() && (force || !fs::exists(PKGJ_GAMES)))
+        if (!net::fetch(games, PKGJ_GAMES, nullptr, err))
+            log_line("pkgj games list: %s", err.c_str());
+    if (!dlcs.empty() && (force || !fs::exists(PKGJ_DLCS)))
+        if (!net::fetch(dlcs, PKGJ_DLCS, nullptr, err))
+            log_line("pkgj dlcs list: %s", err.c_str());
+}
+
+static std::vector<std::string> split_tab(const std::string& line)
+{
+    std::vector<std::string> out;
+    size_t a = 0;
+    for (;;) {
+        size_t b = line.find('\t', a);
+        out.push_back(line.substr(a, b == std::string::npos ? std::string::npos : b - a));
+        if (b == std::string::npos)
+            break;
+        a = b + 1;
+    }
+    return out;
+}
+
+static int load_nps(std::vector<Entry>& out, const std::string& path, bool dlc)
+{
+    std::string text;
+    if (!fs::read(path, text))
+        return 0;
+    int n = 0;
+    size_t pos = text.find('\n');
+    while (pos != std::string::npos && pos + 1 < text.size()) {
+        size_t end = text.find('\n', pos + 1);
+        std::string line = text.substr(pos + 1, end == std::string::npos ? std::string::npos : end - pos - 1);
+        pos = end;
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        auto f = split_tab(line);
+        if (f.size() < 9)
+            continue;
+        const std::string& url = f[3];
+        const std::string& zrif = f[4];
+        if (url.empty() || url == "MISSING" || url == "CART ONLY" || zrif == "MISSING" || f[0].size() != 9)
+            continue;
+        Entry e;
+        e.cat = CAT_GAMES;
+        e.id = f[0];
+        e.region = f[1];
+        e.name = f[2];
+        e.url = url;
+        e.zrif = zrif == "NOT REQUIRED" ? "" : zrif;
+        e.content = f[5];
+        e.dlc = dlc;
+        std::string size = dlc ? f[7] : f[8];
+        std::string sha = dlc ? f[8] : (f.size() > 9 ? f[9] : "");
+        e.size = strtoull(size.c_str(), nullptr, 10);
+        e.sha256 = sha.size() == 64 ? sha : "";
+        if (dlc)
+            e.author = "DLC";
+        else if (f.size() > 10 && !f[10].empty())
+            e.version = "FW " + f[10];
+        e.search = lower(e.name + " " + e.id + (dlc ? " dlc" : ""));
+        out.push_back(std::move(e));
+        n++;
+    }
+    return n;
+}
+
+void Catalog::load_pkgj()
+{
+    auto& g = items[CAT_GAMES];
+    std::string games = fs::exists(PKGJ_GAMES) ? PKGJ_GAMES : "ux0:pkgj/titles_psvgames.tsv";
+    std::string dlcs = fs::exists(PKGJ_DLCS) ? PKGJ_DLCS : "ux0:pkgj/titles_psvdlcs.tsv";
+    pkgj_games = load_nps(g, games, false);
+    pkgj_dlcs = load_nps(g, dlcs, true);
 }
 
 void Installed::load()
@@ -186,7 +306,7 @@ bool Installed::app_exists(const std::string& titleid)
     auto it = app_cache.find(titleid);
     if (it != app_cache.end())
         return it->second;
-    bool ok = fs::exists("ux0:app/" + titleid + "/eboot.bin");
+    bool ok = starts_with(titleid, "dlc:") ? fs::exists(titleid.substr(4)) : fs::exists("ux0:app/" + titleid + "/eboot.bin");
     app_cache[titleid] = ok;
     return ok;
 }
@@ -196,6 +316,10 @@ Status Installed::status(const Entry& e)
     std::lock_guard<std::mutex> lock(m);
     auto it = versions.find(key(e));
     bool recorded = it != versions.end();
+    if (e.cat == CAT_GAMES && e.dlc) {
+        std::string p = e.content.size() >= 36 ? "ux0:addcont/" + e.id + "/" + e.content.substr(20, 16) : "";
+        return !p.empty() && app_exists("dlc:" + p) ? ST_INSTALLED : ST_NONE;
+    }
     if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_GAMES) {
         if (!app_exists(e.id))
             return ST_NONE;

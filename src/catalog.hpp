@@ -26,6 +26,8 @@ struct Entry {
     std::string mirror;
     std::string zrif;
     std::string sha256;
+    std::string content;
+    bool dlc = false;
     uint64_t size = 0;
     std::string icon;
     std::vector<std::string> shots;
@@ -48,8 +50,12 @@ public:
     std::string version;
     std::string media;
 
+    int pkgj_games = 0;
+    int pkgj_dlcs = 0;
+
     bool load_cache();
     bool parse(const std::string& json, std::string& err);
+    void load_pkgj();
     std::string media_url(const std::string& path) const;
 };
 
@@ -68,6 +74,10 @@ private:
     void save();
     bool app_exists(const std::string& titleid);
 };
+
+std::string pkgj_config_path();
+bool pkgj_urls(std::string& games, std::string& dlcs);
+void pkgj_fetch(bool force);
 
 const char* category_key(Category c);
 const char* category_title(Category c);

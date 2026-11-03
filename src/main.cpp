@@ -134,6 +134,7 @@ struct App {
     void draw_badge(float x, float y, const std::string& s, unsigned bg, unsigned fg);
 
     void rebuild();
+    std::string icon_url(const Entry& e);
     std::vector<Entry>& list(int c) { return catalog.items[c]; }
     const Entry* selected();
     void open_detail(const Entry& e);
@@ -149,6 +150,11 @@ struct App {
     void move_sel(int dx, int dy);
     void ensure_visible();
 };
+
+static bool launchable(const Entry& e)
+{
+    return e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || (e.cat == CAT_GAMES && !e.dlc);
+}
 
 static uint32_t read_buttons()
 {
@@ -192,6 +198,15 @@ void App::rebuild()
     }
 }
 
+std::string App::icon_url(const Entry& e)
+{
+    if (!e.icon.empty())
+        return catalog.media_url(e.icon);
+    if (e.cat == CAT_GAMES && !e.dlc && installed.status(e) != ST_NONE)
+        return "ux0:app/" + e.id + "/sce_sys/icon0.png";
+    return "";
+}
+
 const Entry* App::selected()
 {
     if (tab >= CAT_COUNT || filtered[tab].empty())
@@ -205,16 +220,19 @@ int App::refresh_thread(unsigned int, void* arg)
     std::string body, err;
     std::string base = a->settings.base();
     std::unique_ptr<Catalog> c(new Catalog());
-    if (net::get(base + "index.json", body, err) && c->parse(body, err)) {
-        if (c->media.empty())
-            c->media = base + "media/";
+    bool ok = net::get(base + "index.json", body, err) && c->parse(body, err);
+    if (ok)
         fs::write(APP_DIR + "/index.json", body);
+    else
+        c->load_cache();
+    if (c->media.empty())
+        c->media = base + "media/";
+    pkgj_fetch(a->manual_refresh);
+    c->load_pkgj();
+    {
         std::lock_guard<std::mutex> lock(a->refresh_m);
         a->fresh = std::move(c);
-        a->refresh_err.clear();
-    } else {
-        std::lock_guard<std::mutex> lock(a->refresh_m);
-        a->refresh_err = err.empty() ? "Ошибка сети" : err;
+        a->refresh_err = ok ? "" : (err.empty() ? "Ошибка сети" : err);
     }
     a->refreshing = 2;
     return sceKernelExitDeleteThread(0);
@@ -239,14 +257,16 @@ void App::apply_refresh()
     std::lock_guard<std::mutex> lock(refresh_m);
     if (fresh) {
         bool changed = fresh->version != catalog.version;
-        catalog = *fresh;
+        catalog = std::move(*fresh);
         fresh.reset();
-        loaded_once = true;
+        loaded_once = loaded_once || refresh_err.empty();
         rebuild();
-        if (manual_refresh || (changed && !catalog.version.empty()))
+        if (!refresh_err.empty()) {
+            if (manual_refresh || !loaded_once)
+                show_toast("Не удалось обновить каталог: " + refresh_err);
+        } else if (manual_refresh || (changed && !catalog.version.empty())) {
             show_toast(changed ? "Каталог обновлён" : "Каталог актуален");
-    } else if (manual_refresh || !loaded_once) {
-        show_toast("Не удалось обновить каталог: " + refresh_err);
+        }
     }
 }
 
@@ -370,7 +390,7 @@ void App::primary_action()
         return;
     }
     Status st = installed.status(e);
-    if (st == ST_INSTALLED && (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_GAMES)) {
+    if (st == ST_INSTALLED && launchable(e)) {
         launch(e);
         return;
     }
@@ -677,7 +697,7 @@ void App::draw_card(const Entry& e, float x, float y)
     gfx::rrect(x, y, CARD_W, CARD_H, 14, col::SURFACE);
     float a = 0;
     vita2d_texture* img = nullptr;
-    vita2d_texture* icon = e.icon.empty() ? nullptr : images.get(catalog.media_url(e.icon), &a);
+    vita2d_texture* icon = images.get(icon_url(e), &a);
     float ia = a;
     if (!e.shots.empty())
         img = images.get(catalog.media_url(e.shots[0]), &a);
@@ -820,7 +840,7 @@ void App::draw_detail()
     }
     float fade = std::min(1.0f, (now_ms() - shot_time) / 350.0f);
     float ia = 0;
-    vita2d_texture* icon = e.icon.empty() ? nullptr : images.get(catalog.media_url(e.icon), &ia);
+    vita2d_texture* icon = images.get(icon_url(e), &ia);
     if (n) {
         if (prev_shot >= 0 && fade < 1) {
             vita2d_texture* p = images.get(catalog.media_url(e.shots[prev_shot]));
@@ -906,7 +926,7 @@ void App::draw_detail()
     } else {
         std::string label;
         unsigned bg = col::ACCENT;
-        if (st == ST_INSTALLED && (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_GAMES))
+        if (st == ST_INSTALLED && launchable(e))
             label = "Запустить";
         else if (st == ST_INSTALLED) {
             label = "Переустановить";
@@ -1001,7 +1021,7 @@ void App::draw_downloads()
         if (on)
             gfx::rframe(28, y, W - 56, 72, 14, 2, col::ACCENT);
         float a = 0;
-        vita2d_texture* icon = t->entry.icon.empty() ? nullptr : images.get(catalog.media_url(t->entry.icon), &a);
+        vita2d_texture* icon = images.get(icon_url(t->entry), &a);
         if (icon) {
             gfx::fit(icon, 42, y + 12, 48, 48, a);
             gfx::corners(42, y + 12, 48, 48, 10, on ? col::SURFACE2 : col::SURFACE);
@@ -1064,6 +1084,7 @@ void App::draw_settings()
         {"Очистить кеш картинок", ""},
         {"Удалить временные файлы загрузок", ""},
     };
+    std::string pc = pkgj_config_path();
     float y = 76;
     for (int i = 0; i < (int)rows.size(); i++) {
         bool on = i == settings_sel;
@@ -1079,6 +1100,8 @@ void App::draw_settings()
     y += 8;
     std::vector<std::string> about = {
         "Свободно на ux0: " + fmt_size(fs::free_space("ux0:")) + " · плагины: " + tai_dir() + "/config.txt",
+        pc.empty() ? "Списки pkgj: не найден ux0:pkgj/config.txt"
+                   : "Списки pkgj из " + pc + ": игр " + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
         "Каталог: github.com/" + settings.repo + " · приложение: github.com/Risaro/vpkgj",
         "Лицензия GPL-3.0. Установка PKG по мотивам pkgj, установка vpk по мотивам VitaShell и VitaDB Downloader.",
     };
@@ -1113,7 +1136,7 @@ void App::draw_footer()
         Status st = installed.status(detail);
         auto t = tasks.find(detail);
         bool busy = t && (t->state == TS_RUNNING || t->state == TS_QUEUED);
-        std::string ok = busy ? "Отменить" : st == ST_INSTALLED && (detail.cat == CAT_PORTS || detail.cat == CAT_HOMEBREW || detail.cat == CAT_GAMES) ? "Запустить" : "Установить";
+        std::string ok = busy ? "Отменить" : st == ST_INSTALLED && launchable(detail) ? "Запустить" : "Установить";
         x = gfx::hint(x, y, ok_icon, ok);
         if (st != ST_NONE && !busy)
             x = gfx::hint(x, y, BTN_SQUARE, "Переустановить");
@@ -1207,11 +1230,11 @@ void App::run()
     }
     settings.load();
     installed.load();
-    if (catalog.load_cache()) {
-        if (catalog.media.empty())
-            catalog.media = settings.base() + "media/";
+    if (catalog.load_cache())
         loaded_once = true;
-    }
+    if (catalog.media.empty())
+        catalog.media = settings.base() + "media/";
+    catalog.load_pkgj();
     rebuild();
     images.start();
     tasks.start(&installed);

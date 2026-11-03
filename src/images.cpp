@@ -116,8 +116,9 @@ void Images::clear_disk()
 
 void Images::load(const std::string& url)
 {
-    std::string path = CACHE + "/" + hash_name(url);
-    if (!fs::exists(path)) {
+    bool local = !starts_with(url, "http://") && !starts_with(url, "https://");
+    std::string path = local ? url : CACHE + "/" + hash_name(url);
+    if (!local && !fs::exists(path)) {
         std::string err;
         if (!net::fetch(url, path, nullptr, err))
             log_line("image %s: %s", url.c_str(), err.c_str());
@@ -134,7 +135,7 @@ void Images::load(const std::string& url)
             tex = vita2d_load_JPEG_file(path.c_str());
         else if (b[0] == 'B' && b[1] == 'M')
             tex = vita2d_load_BMP_file(path.c_str());
-        if (!tex)
+        if (!tex && !local)
             sceIoRemove(path.c_str());
     }
     if (tex)
