@@ -11,7 +11,7 @@
 enum { IMG_PENDING, IMG_LOADING, IMG_READY, IMG_FAILED };
 
 static const size_t BUDGET = 56u * 1024 * 1024;
-static const std::string CACHE = APP_DIR + "/cache";
+#define CACHE (APP_DIR + "/cache")
 
 void Images::start()
 {

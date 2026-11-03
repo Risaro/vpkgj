@@ -2,6 +2,8 @@
 
 #include "util.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <map>
 
@@ -10,8 +12,121 @@ namespace gfx {
 static std::string font_data[2];
 static std::map<int, vita2d_font*> fonts;
 
+static vita2d_texture* bg_tex = nullptr;
+
+static void make_background()
+{
+    const int w = 480, h = 272;
+    bg_tex = vita2d_create_empty_texture(w, h);
+    if (!bg_tex)
+        return;
+    uint32_t* px = (uint32_t*)vita2d_texture_get_datap(bg_tex);
+    int stride = vita2d_texture_get_stride(bg_tex) / 4;
+    struct Glow {
+        float x, y, r, cr, cg, cb, a;
+    } glows[] = {
+        {60, -20, 260, 76, 141, 255, 0.22f},
+        {470, 290, 300, 150, 90, 255, 0.16f},
+        {300, 120, 200, 40, 200, 180, 0.05f},
+    };
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float r = 13, g = 14, b = 18;
+            for (auto& gl : glows) {
+                float dx = x - gl.x, dy = y - gl.y;
+                float d = sqrtf(dx * dx + dy * dy) / gl.r;
+                if (d < 1) {
+                    float k = (1 - d) * (1 - d) * gl.a;
+                    r += (gl.cr - r) * k;
+                    g += (gl.cg - g) * k;
+                    b += (gl.cb - b) * k;
+                }
+            }
+            float n = ((x * 7 + y * 13) % 5) * 0.4f;
+            px[y * stride + x] = RGBA8((int)(r + n), (int)(g + n), (int)(b + n), 255);
+        }
+    }
+    vita2d_texture_set_filters(bg_tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+}
+
+void background()
+{
+    if (bg_tex)
+        vita2d_draw_texture_scale(bg_tex, 0, 0, 2, 2);
+}
+
+static void hue_rgb(float h, float s, float v, int& r, int& g, int& b)
+{
+    float c = v * s, x = c * (1 - fabsf(fmodf(h / 60, 2) - 1)), m = v - c;
+    float rr = 0, gg = 0, bb = 0;
+    if (h < 60) { rr = c; gg = x; }
+    else if (h < 120) { rr = x; gg = c; }
+    else if (h < 180) { gg = c; bb = x; }
+    else if (h < 240) { gg = x; bb = c; }
+    else if (h < 300) { rr = x; bb = c; }
+    else { rr = c; bb = x; }
+    r = (int)((rr + m) * 255);
+    g = (int)((gg + m) * 255);
+    b = (int)((bb + m) * 255);
+}
+
+static std::string initials(const std::string& name)
+{
+    std::string out;
+    int words = 0;
+    bool start = true;
+    size_t i = 0;
+    while (i < name.size() && words < 2) {
+        unsigned char c = name[i];
+        size_t len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 4;
+        bool alnum = c >= 0x80 || isalnum(c);
+        if (alnum && start) {
+            std::string ch = name.substr(i, len);
+            if (len == 1)
+                ch[0] = toupper(ch[0]);
+            out += ch;
+            words++;
+        }
+        start = !alnum;
+        i += len;
+    }
+    return out;
+}
+
+static void name_colors(const std::string& name, unsigned& c1, unsigned& c2)
+{
+    unsigned hs = 2166136261u;
+    for (unsigned char c : name)
+        hs = (hs ^ c) * 16777619u;
+    float hue = hs % 360;
+    int r1, g1, b1, r2, g2, b2;
+    hue_rgb(hue, 0.55f, 0.42f, r1, g1, b1);
+    hue_rgb(fmodf(hue + 40, 360), 0.6f, 0.22f, r2, g2, b2);
+    c1 = RGBA8(r1, g1, b1, 255);
+    c2 = RGBA8(r2, g2, b2, 255);
+}
+
+void placeholder_round(float x, float y, float w, float h, float r, const std::string& name, int size)
+{
+    unsigned c1, c2;
+    name_colors(name, c1, c2);
+    grad_round(x, y, w, h, r, true, h < w ? false : true, c1, c2);
+    if (size)
+        text_center(bold, x + w / 2, y + h / 2 + size * 0.36f, size, RGBA8(255, 255, 255, 220), initials(name));
+}
+
+void placeholder(float x, float y, float w, float h, const std::string& name, int size)
+{
+    unsigned c1, c2;
+    name_colors(name, c1, c2);
+    vgrad(x, y, w, h, c1, c2);
+    if (size)
+        text_center(bold, x + w / 2, y + h / 2 + size * 0.36f, size, RGBA8(255, 255, 255, 220), initials(name));
+}
+
 bool init()
 {
+    make_background();
     fs::read("app0:assets/Inter-Regular.ttf", font_data[regular]);
     fs::read("app0:assets/Inter-SemiBold.ttf", font_data[bold]);
     if (font_data[bold].empty())
@@ -58,6 +173,100 @@ static void set(vita2d_color_vertex& v, float x, float y, unsigned c)
     v.y = y;
     v.z = 0.5f;
     v.color = c;
+}
+
+static std::vector<std::pair<float, float>> round_poly(float x, float y, float w, float h, float r, bool top, bool bottom)
+{
+    std::vector<std::pair<float, float>> p;
+    const int seg = 6;
+    r = fminf(r, fminf(w, h) / 2);
+    struct C {
+        float cx, cy, a0;
+        bool round;
+    } cs[4] = {
+        {x + w - r, y + h - r, 0, bottom},
+        {x + r, y + h - r, (float)M_PI_2, bottom},
+        {x + r, y + r, (float)M_PI, top},
+        {x + w - r, y + r, (float)M_PI * 1.5f, top},
+    };
+    float px[4] = {x + w, x, x, x + w}, py[4] = {y + h, y + h, y, y};
+    for (int q = 0; q < 4; q++) {
+        if (!cs[q].round || r < 1) {
+            p.push_back({px[q], py[q]});
+            continue;
+        }
+        for (int i = 0; i <= seg; i++) {
+            float a = cs[q].a0 + (float)M_PI_2 * i / seg;
+            p.push_back({cs[q].cx + cosf(a) * r, cs[q].cy + sinf(a) * r});
+        }
+    }
+    return p;
+}
+
+static void textured_poly(vita2d_texture* t, const std::vector<std::pair<float, float>>& pts, float x, float y, float w, float h,
+                          float u0, float v0, float u1, float v1, float a)
+{
+    size_t n = pts.size() + 2;
+    vita2d_texture_vertex* v = (vita2d_texture_vertex*)vita2d_pool_memalign(n * sizeof(vita2d_texture_vertex), sizeof(vita2d_texture_vertex));
+    if (!v)
+        return;
+    auto put = [&](vita2d_texture_vertex& o, float px, float py) {
+        o.x = px;
+        o.y = py;
+        o.z = 0.5f;
+        o.u = u0 + (u1 - u0) * (px - x) / w;
+        o.v = v0 + (v1 - v0) * (py - y) / h;
+    };
+    put(v[0], x + w / 2, y + h / 2);
+    for (size_t i = 0; i < pts.size(); i++)
+        put(v[i + 1], pts[i].first, pts[i].second);
+    v[n - 1] = v[1];
+    vita2d_draw_array_textured(t, SCE_GXM_PRIMITIVE_TRIANGLE_FAN, v, n, RGBA8(255, 255, 255, (int)(255 * fminf(1, fmaxf(0, a)))));
+}
+
+void cover_round(vita2d_texture* t, float x, float y, float w, float h, float r, bool top, bool bottom, float a)
+{
+    float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
+    if (tw <= 0 || th <= 0)
+        return;
+    float s = fmaxf(w / tw, h / th);
+    float cw = w / s, ch = h / s;
+    float cx = (tw - cw) / 2, cy = (th - ch) / 2;
+    textured_poly(t, round_poly(x, y, w, h, r, top, bottom), x, y, w, h, cx / tw, cy / th, (cx + cw) / tw, (cy + ch) / th, a);
+}
+
+void fit_round(vita2d_texture* t, float x, float y, float w, float h, float r, float a)
+{
+    float tw = vita2d_texture_get_width(t), th = vita2d_texture_get_height(t);
+    if (tw <= 0 || th <= 0)
+        return;
+    float s = fminf(w / tw, h / th);
+    float dw = tw * s, dh = th * s;
+    float dx = x + (w - dw) / 2, dy = y + (h - dh) / 2;
+    textured_poly(t, round_poly(dx, dy, dw, dh, r, true, true), dx, dy, dw, dh, 0, 0, 1, 1, a);
+}
+
+void grad_round(float x, float y, float w, float h, float r, bool top, bool bottom, unsigned c1, unsigned c2)
+{
+    auto pts = round_poly(x, y, w, h, r, top, bottom);
+    size_t n = pts.size() + 2;
+    vita2d_color_vertex* v = verts(n);
+    if (!v)
+        return;
+    auto mix = [&](float py) {
+        float k = fminf(1, fmaxf(0, (py - y) / h));
+        unsigned out = 0;
+        for (int sh = 0; sh < 32; sh += 8) {
+            float a = (c1 >> sh) & 0xff, b = (c2 >> sh) & 0xff;
+            out |= ((unsigned)(a + (b - a) * k) & 0xff) << sh;
+        }
+        return out;
+    };
+    set(v[0], x + w / 2, y + h / 2, mix(y + h / 2));
+    for (size_t i = 0; i < pts.size(); i++)
+        set(v[i + 1], pts[i].first, pts[i].second, mix(pts[i].second));
+    v[n - 1] = v[1];
+    vita2d_draw_array(SCE_GXM_PRIMITIVE_TRIANGLE_FAN, v, n);
 }
 
 void rect(float x, float y, float w, float h, unsigned c)

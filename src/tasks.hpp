@@ -13,6 +13,7 @@ enum TaskState { TS_QUEUED, TS_RUNNING, TS_DONE, TS_FAILED, TS_CANCELED };
 
 struct Task {
     Entry entry;
+    std::vector<Entry> deps;
     std::atomic<int> state{TS_QUEUED};
     net::Progress progress;
     std::mutex m;
@@ -22,6 +23,8 @@ struct Task {
     uint64_t sample_time = 0;
     uint64_t sample_bytes = 0;
     double speed = 0;
+    bool reboot = false;
+    bool notified = false;
 
     std::string get_stage();
     std::string get_error();
@@ -32,7 +35,7 @@ class Tasks {
 public:
     void start(Installed* installed);
     void stop();
-    std::shared_ptr<Task> add(const Entry& e);
+    std::shared_ptr<Task> add(const Entry& e, const std::vector<Entry>& deps = {});
     std::shared_ptr<Task> find(const Entry& e);
     std::vector<std::shared_ptr<Task>> list();
     void clear_finished();
@@ -49,3 +52,4 @@ private:
 };
 
 std::string tai_dir();
+bool plugin_present(const Entry& plugin);

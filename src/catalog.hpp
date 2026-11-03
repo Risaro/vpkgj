@@ -27,6 +27,8 @@ struct Entry {
     std::string zrif;
     std::string sha256;
     std::string content;
+    std::string needs;
+    std::string check;
     bool dlc = false;
     uint64_t size = 0;
     std::string icon;
@@ -56,6 +58,7 @@ public:
     bool load_cache();
     bool parse(const std::string& json, std::string& err);
     void load_pkgj();
+    void apply_covers();
     std::string media_url(const std::string& path) const;
 };
 

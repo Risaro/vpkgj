@@ -1,8 +1,11 @@
+#include "backup.hpp"
+#include "bgdl.hpp"
 #include "catalog.hpp"
 #include "gfx.hpp"
 #include "images.hpp"
 #include "ime.hpp"
 #include "net.hpp"
+#include "pkg.hpp"
 #include "promote.hpp"
 #include "tasks.hpp"
 #include "util.hpp"
@@ -44,7 +47,7 @@ static const int GRID_TOP = HEADER_H + 14;
 static const int TAB_DOWNLOADS = CAT_COUNT;
 static const int TAB_COUNT = CAT_COUNT + 1;
 
-enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS };
+enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS, SCR_BACKUPS };
 enum ImePurpose { IME_NONE, IME_SEARCH, IME_REPO, IME_BRANCH };
 
 struct Hit {
@@ -58,6 +61,8 @@ struct Modal {
     std::vector<std::string> lines;
     std::string yes;
     std::function<void()> action;
+    std::string alt;
+    std::function<void()> alt_action;
 };
 
 struct App {
@@ -83,8 +88,25 @@ struct App {
     float desc_scroll = 0;
     float desc_target = 0;
     std::vector<std::string> desc_lines;
+    std::vector<Entry> detail_deps;
+    std::vector<Entry> related;
+    std::vector<std::string> related_kind;
+    std::vector<Entry> back_stack;
+    int rel_sel = -1;
+    bool has_saves = false;
+    float rel_scroll = 0;
+    void go_back();
+    void draw_related();
+    std::vector<bool> detail_dep_ok;
+    void check_deps();
 
     int settings_sel = 0;
+    int backup_sel = 0;
+    std::vector<Backup> backups;
+    void draw_backups();
+    void open_backups();
+    void saves_menu(const Entry& e);
+    void check_reboot();
     int dl_sel = 0;
 
     float fx = 0, fy = 0, fw = 0, fh = 0;
@@ -134,6 +156,7 @@ struct App {
     void draw_badge(float x, float y, const std::string& s, unsigned bg, unsigned fg);
 
     void rebuild();
+    std::vector<Entry> deps_of(const Entry& e);
     std::string icon_url(const Entry& e);
     std::vector<Entry>& list(int c) { return catalog.items[c]; }
     const Entry* selected();
@@ -141,6 +164,7 @@ struct App {
     void primary_action();
     void ask_install(const Entry& e, bool reinstall);
     void launch(const Entry& e);
+    void background_download(const Entry& e);
     void show_toast(const std::string& s);
     void start_refresh(bool manual);
     static int refresh_thread(unsigned int, void* arg);
@@ -203,8 +227,39 @@ std::string App::icon_url(const Entry& e)
     if (!e.icon.empty())
         return catalog.media_url(e.icon);
     if (e.cat == CAT_GAMES && !e.dlc && installed.status(e) != ST_NONE)
-        return "ux0:app/" + e.id + "/sce_sys/icon0.png";
+        return "ur0:appmeta/" + e.id + "/icon0.png";
     return "";
+}
+
+std::vector<Entry> App::deps_of(const Entry& e)
+{
+    std::vector<std::string> ids;
+    std::string cur;
+    for (char c : e.needs + ",") {
+        if (c == ',' || c == ' ' || c == ';') {
+            if (!cur.empty())
+                ids.push_back(lower(cur));
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (e.cat == CAT_TRANSLATIONS && (e.install.empty() || lower(e.install).find("repatch") != std::string::npos))
+        if (std::find(ids.begin(), ids.end(), "repatch") == ids.end())
+            ids.insert(ids.begin(), "repatch");
+    std::vector<Entry> out;
+    for (auto& id : ids)
+        for (auto& p : catalog.items[CAT_PLUGINS])
+            if (lower(p.id) == id && !(e.cat == CAT_PLUGINS && p.id == e.id))
+                out.push_back(p);
+    return out;
+}
+
+void App::check_deps()
+{
+    detail_dep_ok.clear();
+    for (auto& d : detail_deps)
+        detail_dep_ok.push_back(plugin_present(d));
 }
 
 const Entry* App::selected()
@@ -228,7 +283,11 @@ int App::refresh_thread(unsigned int, void* arg)
     if (c->media.empty())
         c->media = base + "media/";
     pkgj_fetch(a->manual_refresh);
+    std::string covers;
+    if ((a->manual_refresh || !fs::exists(APP_DIR + "/covers.json") || ok) && net::get(base + "covers.json", covers, err) && covers.size() > 2 && covers[0] == '{')
+        fs::write(APP_DIR + "/covers.json", covers);
     c->load_pkgj();
+    c->apply_covers();
     {
         std::lock_guard<std::mutex> lock(a->refresh_m);
         a->fresh = std::move(c);
@@ -317,14 +376,82 @@ void App::move_sel(int dx, int dy)
 void App::open_detail(const Entry& e)
 {
     detail = e;
+    rel_sel = -1;
+    has_saves = !e.id.empty() && fs::exists(savedata_path(e.id));
+    related.clear();
+    related_kind.clear();
+    auto add = [&](const Entry& x, const std::string& kind) {
+        if (related.size() < 60) {
+            related.push_back(x);
+            related_kind.push_back(kind);
+        }
+    };
+    if (e.cat == CAT_GAMES && !e.dlc) {
+        for (auto& t : catalog.items[CAT_TRANSLATIONS])
+            if (t.id == e.id)
+                add(t, "Русификатор");
+        for (auto& p : catalog.items[CAT_PORTS])
+            if (p.id == e.id)
+                add(p, "Порт");
+        for (auto& d : catalog.items[CAT_GAMES])
+            if (d.dlc && d.id == e.id)
+                add(d, "DLC");
+    } else if (e.cat == CAT_TRANSLATIONS || (e.cat == CAT_GAMES && e.dlc)) {
+        for (auto& g : catalog.items[CAT_GAMES])
+            if (!g.dlc && g.id == e.id)
+                add(g, g.region.empty() ? "Игра" : "Игра " + g.region);
+        if (e.cat == CAT_TRANSLATIONS)
+            for (auto& d : catalog.items[CAT_GAMES])
+                if (d.dlc && d.id == e.id)
+                    add(d, "DLC");
+    }
     shot = 0;
     prev_shot = -1;
     shot_time = now_ms();
     shot_auto = now_ms() + 6000;
     desc_scroll = desc_target = 0;
-    std::string d = e.description.empty() ? "Описание пока не добавлено." : e.description;
+    std::string d = e.description;
+    if (e.cat == CAT_GAMES) {
+        std::string info;
+        if (!e.region.empty())
+            info += "Регион: " + e.region + "\n";
+        if (!e.content.empty())
+            info += "Content ID: " + e.content + "\n";
+        if (e.size)
+            info += "Размер: " + fmt_size(e.size) + "\n";
+        if (starts_with(e.version, "FW "))
+            info += "Нужна прошивка " + e.version.substr(3) + " или новее\n";
+        if (!e.dlc) {
+            int dlcs = 0;
+            for (auto& x : catalog.items[CAT_GAMES])
+                if (x.dlc && x.id == e.id)
+                    dlcs++;
+            if (dlcs)
+                info += "DLC в списке: " + std::to_string(dlcs) + ", найдёшь поиском по " + e.id + "\n";
+        }
+        d = d.empty() ? info : d + "\n\n" + info;
+    }
+    if (trim(d).empty())
+        d = "Описание пока не добавлено.";
     desc_lines = gfx::wrap(gfx::regular, 15, d, W - 64);
+    detail_deps = deps_of(e);
+    check_deps();
     screen = SCR_DETAIL;
+}
+
+void App::background_download(const Entry& e)
+{
+    std::vector<uint8_t> rif;
+    std::string err;
+    if (!e.zrif.empty() && !zrif_decode(e.zrif, rif, err)) {
+        show_toast(err);
+        return;
+    }
+    std::string url = e.url.substr(0, e.url.find_first_of("|;"));
+    if (bgdl_start(e.dlc ? BGDL_DLC : BGDL_GAME, e.name, url, rif, err))
+        show_toast("Качается системой в фоне, установка из уведомлений");
+    else
+        show_toast("Фоновая загрузка: " + err);
 }
 
 void App::launch(const Entry& e)
@@ -368,12 +495,37 @@ void App::ask_install(const Entry& e, bool reinstall)
     default:
         break;
     }
+    std::vector<Entry> deps = deps_of(e);
+    std::string need;
+    for (auto& d : deps)
+        if (!plugin_present(d))
+            need += (need.empty() ? "" : ", ") + d.name;
+    if (!need.empty())
+        modal.lines.push_back("Сначала поставится: " + need);
     modal.yes = reinstall ? "Переустановить" : "Установить";
     Entry copy = e;
-    modal.action = [this, copy]() {
-        tasks.add(copy);
+    modal.action = [this, copy, deps]() {
+        tasks.add(copy, deps);
         show_toast("Добавлено в загрузки");
     };
+    if (e.cat == CAT_GAMES && !e.dlc) {
+        std::vector<Entry> trs;
+        for (auto& t : catalog.items[CAT_TRANSLATIONS])
+            if (t.id == e.id)
+                trs.push_back(t);
+        if (!trs.empty()) {
+            modal.lines.push_back("Есть русификатор: " + trs[0].name + (trs[0].lang.empty() ? "" : " (" + trs[0].lang + ")"));
+            modal.yes = "Игра + русификатор";
+            modal.alt = "Только игра";
+            modal.alt_action = modal.action;
+            modal.action = [this, copy, deps, trs]() {
+                tasks.add(copy, deps);
+                for (auto& t : trs)
+                    tasks.add(t, deps_of(t));
+                show_toast("Игра и русификатор добавлены в загрузки");
+            };
+        }
+    }
 }
 
 void App::primary_action()
@@ -406,6 +558,17 @@ void App::ime_done(const std::string& text)
         if (tab < CAT_COUNT) {
             sel[tab] = 0;
             scroll_target[tab] = 0;
+        }
+        if (!query.empty() && (tab >= CAT_COUNT || filtered[tab].empty())) {
+            for (int c = 0; c < CAT_COUNT; c++) {
+                if (!filtered[c].empty()) {
+                    set_tab(c);
+                    sel[c] = 0;
+                    scroll_target[c] = 0;
+                    show_toast(std::string("Нашлось во вкладке ") + category_title((Category)c));
+                    break;
+                }
+            }
         }
         break;
     case IME_REPO:
@@ -514,6 +677,9 @@ void App::input()
             modal.on = false;
             if (modal.action)
                 modal.action();
+        } else if ((pressed & SCE_CTRL_TRIANGLE) && modal.alt_action) {
+            modal.on = false;
+            modal.alt_action();
         } else if (pressed & back_btn) {
             modal.on = false;
         }
@@ -551,7 +717,7 @@ void App::input()
                     modal.yes = "Отменить";
                     modal.action = [t]() { t->progress.cancel = true; };
                 } else if (t->state == TS_FAILED || t->state == TS_CANCELED) {
-                    tasks.add(t->entry);
+                    tasks.add(t->entry, t->deps);
                     show_toast("Повторная попытка");
                 }
             }
@@ -578,27 +744,56 @@ void App::input()
         if (pressed & ok_btn) {
             const Entry* e = selected();
             if (e)
-                open_detail(*e);
+                { back_stack.clear(); open_detail(*e); }
         }
         return;
     }
 
     if (screen == SCR_DETAIL) {
         int n = (int)detail.shots.size();
+        int rn = (int)related.size();
+        if (rel_sel >= 0) {
+            if (act & SCE_CTRL_LEFT)
+                rel_sel = std::max(0, rel_sel - 1);
+            if (act & SCE_CTRL_RIGHT)
+                rel_sel = std::min(rn - 1, rel_sel + 1);
+            if (act & SCE_CTRL_UP)
+                rel_sel = -1;
+            if (act & RS_DOWN)
+                desc_target += 44;
+            if (act & RS_UP)
+                desc_target -= 44;
+            if (pressed & back_btn)
+                go_back();
+            else if ((pressed & ok_btn) && rel_sel >= 0 && rel_sel < rn) {
+                back_stack.push_back(detail);
+                Entry next = related[rel_sel];
+                open_detail(next);
+            }
+            return;
+        }
         if (n > 1 && (act & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))) {
             prev_shot = shot;
             shot = (shot + ((act & SCE_CTRL_RIGHT) ? 1 : n - 1)) % n;
             shot_time = now_ms();
             shot_auto = now_ms() + 8000;
         }
-        if (act & (SCE_CTRL_DOWN | RS_DOWN))
+        if (rn && (act & SCE_CTRL_DOWN))
+            rel_sel = 0;
+        else if (act & (SCE_CTRL_DOWN | RS_DOWN))
             desc_target += 44;
         if (act & (SCE_CTRL_UP | RS_UP))
             desc_target -= 44;
-        if (pressed & back_btn)
-            screen = SCR_BROWSE;
+        if (pressed & back_btn) {
+            go_back();
+            return;
+        }
         if (pressed & ok_btn)
             primary_action();
+        if ((pressed & SCE_CTRL_TRIANGLE) && detail.cat == CAT_GAMES)
+            background_download(detail);
+        if ((pressed & SCE_CTRL_RTRIGGER) && has_saves)
+            saves_menu(detail);
         if ((pressed & SCE_CTRL_SQUARE) && installed.status(detail) != ST_NONE) {
             auto t = tasks.find(detail);
             if (!t || (t->state != TS_RUNNING && t->state != TS_QUEUED))
@@ -607,11 +802,67 @@ void App::input()
         return;
     }
 
+    if (screen == SCR_BACKUPS) {
+        int n = (int)backups.size();
+        if (act & SCE_CTRL_UP)
+            backup_sel = std::max(0, backup_sel - 1);
+        if (act & SCE_CTRL_DOWN)
+            backup_sel = std::min(std::max(0, n - 1), backup_sel + 1);
+        if (pressed & back_btn) {
+            screen = SCR_SETTINGS;
+            return;
+        }
+        if (n && (pressed & ok_btn)) {
+            Backup b = backups[backup_sel];
+            modal = Modal();
+            modal.on = true;
+            modal.title = "Восстановить копию?";
+            modal.lines.push_back(b.label);
+            for (auto& it : b.items)
+                modal.lines.push_back("Вернётся: " + it.first);
+            modal.yes = "Восстановить";
+            modal.action = [this, b]() {
+                std::string err;
+                if (backup_restore(b, err)) {
+                    show_toast("Восстановлено");
+                    bool tai = false;
+                    for (auto& it : b.items)
+                        if (it.first.find("tai/config.txt") != std::string::npos)
+                            tai = true;
+                    if (tai) {
+                        modal = Modal();
+                        modal.on = true;
+                        modal.title = "Нужна перезагрузка";
+                        modal.lines.push_back("config.txt восстановлен, изменения вступят в силу после перезагрузки");
+                        modal.yes = "Перезагрузить";
+                        modal.action = []() { scePowerRequestColdReset(); };
+                    }
+                } else {
+                    show_toast(err);
+                }
+            };
+        }
+        if (n && (pressed & SCE_CTRL_TRIANGLE)) {
+            Backup b = backups[backup_sel];
+            modal = Modal();
+            modal.on = true;
+            modal.title = "Удалить копию?";
+            modal.lines.push_back(b.label);
+            modal.yes = "Удалить";
+            modal.action = [this, b]() {
+                backup_delete(b);
+                open_backups();
+                show_toast("Копия удалена");
+            };
+        }
+        return;
+    }
+
     if (screen == SCR_SETTINGS) {
         if (act & SCE_CTRL_UP)
             settings_sel = std::max(0, settings_sel - 1);
         if (act & SCE_CTRL_DOWN)
-            settings_sel = std::min(4, settings_sel + 1);
+            settings_sel = std::min(5, settings_sel + 1);
         if (pressed & (back_btn | SCE_CTRL_START | SCE_CTRL_SELECT)) {
             screen = SCR_BROWSE;
             return;
@@ -644,6 +895,9 @@ void App::input()
                     show_toast("Временные файлы удалены");
                 }
                 break;
+            case 5:
+                open_backups();
+                break;
             }
         }
     }
@@ -659,7 +913,6 @@ void App::draw_badge(float x, float y, const std::string& s, unsigned bg, unsign
 void App::draw_header()
 {
     hits.push_back({0, 0, (float)W, (float)HEADER_H, []() {}});
-    gfx::rect(0, 0, W, HEADER_H, col::BG);
     gfx::text(gfx::bold, 28, 41, 24, col::TEXT, "VPKGJ");
     gfx::circle(108, 33, 3.5f, col::ACCENT);
     float x = 132;
@@ -667,6 +920,8 @@ void App::draw_header()
     x += 34;
     for (int t = 0; t < TAB_COUNT; t++) {
         std::string label = t == TAB_DOWNLOADS ? "Загрузки" : category_title((Category)t);
+        if (!query.empty() && t < CAT_COUNT)
+            label += " " + std::to_string(filtered[t].size());
         int n = t == TAB_DOWNLOADS ? tasks.active() : 0;
         int tw = gfx::width(gfx::bold, 15, label);
         float w = tw + 28 + (n ? 26 : 0);
@@ -689,7 +944,6 @@ void App::draw_header()
     gfx::button(BTN_R, x + 6, 23, 20);
     if (refreshing == 1)
         gfx::spinner(W - 28, 33, 7, col::MUTED);
-    gfx::vgrad(0, HEADER_H, W, 14, col::BG, gfx::alpha(col::BG, 0));
 }
 
 void App::draw_card(const Entry& e, float x, float y)
@@ -702,22 +956,20 @@ void App::draw_card(const Entry& e, float x, float y)
     if (!e.shots.empty())
         img = images.get(catalog.media_url(e.shots[0]), &a);
     if (img) {
-        gfx::cover(img, x, y, CARD_W, CARD_IMG_H, a);
+        if (a < 1)
+            gfx::placeholder_round(x, y, CARD_W, CARD_IMG_H, 14, e.name, 34);
+        gfx::cover_round(img, x, y, CARD_W, CARD_IMG_H, 14, true, false, a);
         if (icon) {
-            gfx::rrect(x + 10, y + CARD_IMG_H - 50, 44, 44, 8, gfx::alpha(col::BG, 0.6f * ia));
-            gfx::fit(icon, x + 12, y + CARD_IMG_H - 48, 40, 40, ia);
+            gfx::rrect(x + 9, y + CARD_IMG_H - 59, 54, 54, 10, gfx::alpha(col::BG, 0.65f * ia));
+            gfx::fit_round(icon, x + 12, y + CARD_IMG_H - 56, 48, 48, 8, ia);
         }
+    } else if (icon) {
+        gfx::placeholder_round(x, y, CARD_W, CARD_IMG_H, 14, e.name, 0);
+        gfx::fit_round(icon, x + CARD_W / 2 - 50, y + 6, 100, CARD_IMG_H - 12, 6, ia);
     } else {
-        gfx::vgrad(x, y, CARD_W, CARD_IMG_H, col::SURFACE2, col::SURFACE);
-        if (icon) {
-            gfx::fit(icon, x + CARD_W / 2 - 40, y + CARD_IMG_H / 2 - 40, 80, 80, ia);
-        } else {
-            std::string first = e.name.substr(0, (unsigned char)e.name[0] >= 0xc0 ? 2 : 1);
-            gfx::text_center(gfx::bold, x + CARD_W / 2, y + CARD_IMG_H / 2 + 16, 44, col::LINE, first);
-        }
+        gfx::placeholder_round(x, y, CARD_W, CARD_IMG_H, 14, e.name, 34);
     }
-    gfx::corners(x, y, CARD_W, CARD_H, 14, col::BG, true, false);
-    gfx::vgrad(x, y + CARD_IMG_H - 1, CARD_W, 1, col::LINE, col::LINE);
+    gfx::rect(x, y + CARD_IMG_H - 1, CARD_W, 1, col::LINE);
 
     float bx = x + CARD_W - 8;
     auto t = tasks.find(e);
@@ -811,7 +1063,7 @@ void App::draw_grid()
                             if (sel[tab] == idx) {
                                 const Entry* e = selected();
                                 if (e)
-                                    open_detail(*e);
+                                    { back_stack.clear(); open_detail(*e); }
                             } else {
                                 sel[tab] = idx;
                                 ensure_visible();
@@ -856,9 +1108,9 @@ void App::draw_detail()
         for (int i = 1; i < 3 && i < n; i++)
             images.get(catalog.media_url(e.shots[(shot + i) % n]));
     } else {
-        gfx::vgrad(0, 0, W, HERO, col::SURFACE2, col::BG);
+        gfx::placeholder(0, 0, W, HERO, e.name, 0);
         if (icon)
-            gfx::fit(icon, W / 2 - 80, 50, 160, 160, ia * 0.35f);
+            gfx::fit(icon, W / 2 - 110, 0, 220, HERO, ia * 0.3f);
     }
     gfx::vgrad(0, 0, W, 90, gfx::alpha(col::BG, 0.75f), gfx::alpha(col::BG, 0));
     gfx::vgrad(0, HERO - 150, W, 150, gfx::alpha(col::BG, 0), col::BG);
@@ -867,7 +1119,7 @@ void App::draw_detail()
     gfx::rrect(20, 16, 98, 34, 17, gfx::alpha(col::BG, 0.7f));
     gfx::button(back_icon, 28, 23, 20);
     gfx::text(gfx::regular, 56, 38, 14, col::TEXT, "Назад");
-    hits.push_back({20, 16, 98, 34, [this]() { screen = SCR_BROWSE; }});
+    hits.push_back({20, 16, 98, 34, [this]() { go_back(); }});
 
     if (n > 1) {
         float dw = n * 14;
@@ -889,14 +1141,10 @@ void App::draw_detail()
 
     float iy = HERO - 96;
     gfx::rrect(28, iy - 4, 104, 104, 20, col::BG);
-    if (icon) {
-        gfx::fit(icon, 32, iy, 96, 96, ia);
-        gfx::corners(32, iy, 96, 96, 16, col::BG);
-    } else {
-        gfx::rrect(32, iy, 96, 96, 16, col::SURFACE2);
-        std::string first = e.name.substr(0, (unsigned char)e.name[0] >= 0xc0 ? 2 : 1);
-        gfx::text_center(gfx::bold, 80, iy + 64, 40, col::MUTED, first);
-    }
+    if (icon)
+        gfx::fit_round(icon, 32, iy, 96, 96, 14, ia);
+    else
+        gfx::placeholder_round(32, iy, 96, 96, 16, e.name, 34);
 
     float bw = 236, bx = W - 28 - bw, by = HERO - 70;
     float tx = 148;
@@ -938,6 +1186,8 @@ void App::draw_detail()
         if (st == ST_UPDATE)
             bg = col::ORANGE;
         gfx::rrect(bx, by, bw, 50, 25, bg);
+        if (!related.empty() && rel_sel < 0)
+            gfx::rframe(bx - 3, by - 3, bw + 6, 56, 28, 2, col::TEXT);
         gfx::button(ok_icon, bx + 18, by + 15, 20);
         gfx::text_center(gfx::bold, bx + bw / 2 + 12, by + 31, 16, st == ST_UPDATE ? col::BG : col::TEXT, label);
     }
@@ -967,6 +1217,8 @@ void App::draw_detail()
         chip("Нужен плагин, ставится сам", col::TEXT);
     if (e.cat == CAT_PLUGINS && !e.tai_section.empty())
         chip(e.tai_section, col::TEXT);
+    for (size_t i = 0; i < detail_deps.size(); i++)
+        chip(detail_deps[i].name + (detail_dep_ok[i] ? ": есть" : ": поставится сам"), detail_dep_ok[i] ? col::GREEN : col::ORANGE);
     if (st == ST_INSTALLED)
         chip("Установлено", col::GREEN);
     if (st == ST_UPDATE)
@@ -976,7 +1228,7 @@ void App::draw_detail()
     if (t && t->state == TS_DONE && !t->note.empty())
         chip(t->note, col::ORANGE);
 
-    float top = HERO + 54, bottom = FOOTER_Y - 6;
+    float top = HERO + 54, bottom = related.empty() ? FOOTER_Y - 6 : FOOTER_Y - 112;
     float lh = 22;
     float maxs = std::max(0.0f, desc_lines.size() * lh - (bottom - top));
     desc_target = std::max(0.0f, std::min(maxs, desc_target));
@@ -996,6 +1248,160 @@ void App::draw_detail()
         float byy = top + (vh - bh) * (desc_scroll / maxs);
         gfx::rrect(W - 12, byy, 4, bh, 2, col::LINE);
     }
+    draw_related();
+}
+
+void App::open_backups()
+{
+    backups = backup_list();
+    if (backup_sel >= (int)backups.size())
+        backup_sel = std::max(0, (int)backups.size() - 1);
+    screen = SCR_BACKUPS;
+}
+
+void App::saves_menu(const Entry& e)
+{
+    std::string label = "Сохранения " + e.id + " (" + e.name + ")";
+    std::vector<Backup> mine;
+    for (auto& b : backup_list())
+        if (b.label == label)
+            mine.push_back(b);
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Сохранения " + e.name;
+    modal.lines.push_back("Папка: " + savedata_path(e.id) + ", " + fmt_size(tree_size(savedata_path(e.id))));
+    modal.lines.push_back(mine.empty() ? "Копий пока нет" : "Последняя копия: " + mine[0].date + ", всего копий: " + std::to_string(mine.size()));
+    modal.lines.push_back("Восстанавливай на этой же консоли, игра должна быть закрыта");
+    modal.yes = "Сделать копию";
+    std::string path = savedata_path(e.id);
+    modal.action = [this, label, path]() {
+        std::string err;
+        if (backup_create(label, {path}, err))
+            show_toast("Копия сохранений готова");
+        else
+            show_toast(err);
+    };
+    if (!mine.empty()) {
+        Backup last = mine[0];
+        modal.alt = "Восстановить последнюю";
+        modal.alt_action = [this, last]() {
+            std::string err;
+            show_toast(backup_restore(last, err) ? "Сохранения восстановлены" : err);
+        };
+    }
+}
+
+void App::check_reboot()
+{
+    if (modal.on)
+        return;
+    for (auto& t : tasks.list()) {
+        if (t->state == TS_DONE && t->reboot && !t->notified) {
+            t->notified = true;
+            modal = Modal();
+            modal.on = true;
+            modal.title = "Нужна перезагрузка";
+            modal.lines.push_back(t->entry.name + " установлен.");
+            modal.lines.push_back("Плагины включатся только после перезагрузки консоли.");
+            if (tasks.active())
+                modal.lines.push_back("Сначала дождись остальных загрузок.");
+            modal.yes = "Перезагрузить";
+            modal.action = [this]() {
+                if (tasks.active())
+                    show_toast("Дождись окончания загрузок");
+                else
+                    scePowerRequestColdReset();
+            };
+            return;
+        }
+    }
+}
+
+void App::draw_backups()
+{
+    gfx::text(gfx::bold, 32, 46, 24, col::TEXT, "Резервные копии");
+    gfx::text_right(gfx::regular, W - 32, 44, 14, col::MUTED, "ux0:data/VPKGJ/backups");
+    if (backups.empty()) {
+        gfx::text_center(gfx::bold, W / 2, 260, 20, col::TEXT, "Копий пока нет");
+        gfx::text_center(gfx::regular, W / 2, 290, 15, col::MUTED, "Они появятся перед установкой плагинов и переводов");
+        gfx::text_center(gfx::regular, W / 2, 314, 15, col::MUTED, "Копию сохранений игры делай в её карточке кнопкой R");
+        return;
+    }
+    float y = 70;
+    int first = std::max(0, backup_sel - 4);
+    for (int i = first; i < (int)backups.size() && y < FOOTER_Y - 60; i++) {
+        auto& b = backups[i];
+        bool on = i == backup_sel;
+        gfx::rrect(28, y, W - 56, 62, 12, on ? col::SURFACE2 : col::SURFACE);
+        if (on)
+            gfx::rframe(28, y, W - 56, 62, 12, 2, col::ACCENT);
+        gfx::text(gfx::bold, 46, y + 26, 15, col::TEXT, gfx::ellipsize(gfx::bold, 15, b.label, 700));
+        std::string items;
+        for (auto& it : b.items)
+            items += (items.empty() ? "" : ", ") + it.first;
+        gfx::text(gfx::regular, 46, y + 48, 12, col::MUTED, gfx::ellipsize(gfx::regular, 12, b.date + " · " + fmt_size(b.size) + " · " + items, 860));
+        int idx = i;
+        hits.push_back({28, y, (float)(W - 56), 62, [this, idx]() { backup_sel = idx; }});
+        y += 70;
+    }
+}
+
+void App::go_back()
+{
+    if (back_stack.empty()) {
+        screen = SCR_BROWSE;
+        return;
+    }
+    Entry prev = back_stack.back();
+    back_stack.pop_back();
+    open_detail(prev);
+}
+
+void App::draw_related()
+{
+    if (related.empty())
+        return;
+    const float cw = 228, ch = 74, gap = 12;
+    float y = FOOTER_Y - 84;
+    gfx::text(gfx::bold, 32, y - 12, 14, col::TEXT, "Связанное");
+    gfx::text(gfx::regular, 32 + gfx::width(gfx::bold, 14, "Связанное") + 8, y - 12, 13, col::MUTED, std::to_string(related.size()));
+    float target = rel_sel < 0 ? 0 : std::max(0.0f, (rel_sel - 2) * (cw + gap));
+    rel_scroll += (target - rel_scroll) * 0.25f;
+    vita2d_set_clip_rectangle(0, (int)y - 6, W, (int)(y + ch + 6));
+    vita2d_enable_clipping();
+    for (size_t i = 0; i < related.size(); i++) {
+        float x = 28 + i * (cw + gap) - rel_scroll;
+        if (x > W || x + cw < 0)
+            continue;
+        const Entry& r = related[i];
+        bool on = (int)i == rel_sel;
+        gfx::rrect(x, y, cw, ch, 14, on ? col::SURFACE2 : gfx::alpha(col::SURFACE, 0.92f));
+        if (on)
+            gfx::rframe(x, y, cw, ch, 14, 2, col::ACCENT);
+        float a = 0;
+        vita2d_texture* ic = images.get(icon_url(r), &a);
+        if (ic)
+            gfx::fit_round(ic, x + 10, y + 10, 54, 54, 10, a);
+        else
+            gfx::placeholder_round(x + 10, y + 10, 54, 54, 10, r.name, 18);
+        unsigned kc = related_kind[i] == "Русификатор" ? col::GREEN : related_kind[i] == "DLC" ? col::ORANGE : col::ACCENT;
+        gfx::text(gfx::bold, x + 74, y + 28, 12, kc, related_kind[i]);
+        gfx::text(gfx::bold, x + 74, y + 48, 14, col::TEXT, gfx::ellipsize(gfx::bold, 14, r.name, (int)cw - 84));
+        Status st = installed.status(r);
+        std::string sub = st == ST_INSTALLED ? "Установлено" : r.size ? fmt_size(r.size) : r.version;
+        gfx::text(gfx::regular, x + 74, y + 65, 12, st == ST_INSTALLED ? col::GREEN : col::MUTED, sub);
+        int idx = (int)i;
+        hits.push_back({x, y, cw, ch, [this, idx]() {
+                            if (rel_sel == idx) {
+                                back_stack.push_back(detail);
+                                Entry next = related[idx];
+                                open_detail(next);
+                            } else {
+                                rel_sel = idx;
+                            }
+                        }});
+    }
+    vita2d_disable_clipping();
 }
 
 void App::draw_downloads()
@@ -1083,19 +1489,24 @@ void App::draw_settings()
         {"Обновить каталог", catalog.version.empty() ? "" : "версия " + catalog.version},
         {"Очистить кеш картинок", ""},
         {"Удалить временные файлы загрузок", ""},
+        {"Резервные копии", "config.txt, rePatch, сохранения"},
     };
     std::string pc = pkgj_config_path();
     float y = 76;
     for (int i = 0; i < (int)rows.size(); i++) {
         bool on = i == settings_sel;
-        gfx::rrect(28, y, W - 56, 52, 12, on ? col::SURFACE2 : col::SURFACE);
+        gfx::rrect(28, y, W - 56, 48, 12, on ? col::SURFACE2 : col::SURFACE);
         if (on)
-            gfx::rframe(28, y, W - 56, 52, 12, 2, col::ACCENT);
-        gfx::text(gfx::regular, 48, y + 32, 16, col::TEXT, rows[i].title);
-        gfx::text_right(gfx::regular, W - 48, y + 32, 15, col::MUTED, rows[i].value);
+            gfx::rframe(28, y, W - 56, 48, 12, 2, col::ACCENT);
+        gfx::text(gfx::regular, 48, y + 30, 16, col::TEXT, rows[i].title);
+        gfx::text_right(gfx::regular, W - 48, y + 30, 15, col::MUTED, rows[i].value);
         int idx = i;
-        hits.push_back({28, y, (float)(W - 56), 52, [this, idx]() { settings_sel = idx; }});
-        y += 60;
+        hits.push_back({28, y, (float)(W - 56), 48, [this, idx]() {
+                            if (settings_sel == idx && idx == 5)
+                                open_backups();
+                            settings_sel = idx;
+                        }});
+        y += 54;
     }
     y += 8;
     std::vector<std::string> about = {
@@ -1113,11 +1524,13 @@ void App::draw_settings()
 
 void App::draw_footer()
 {
-    gfx::vgrad(0, FOOTER_Y - 18, W, 18, gfx::alpha(col::BG, 0), col::BG);
-    gfx::rect(0, FOOTER_Y, W, H - FOOTER_Y, col::BG);
+    if (screen == SCR_DETAIL)
+        gfx::rect(0, FOOTER_Y, W, H - FOOTER_Y, col::BG);
     float x = 28, y = FOOTER_Y + 8;
     if (modal.on) {
         x = gfx::hint(x, y, ok_icon, modal.yes);
+        if (!modal.alt.empty())
+            x = gfx::hint(x, y, BTN_TRIANGLE, modal.alt);
         gfx::hint(x, y, back_icon, "Закрыть");
         return;
     }
@@ -1132,6 +1545,10 @@ void App::draw_footer()
         x = gfx::hint(x, y, ok_icon, "Отменить или повторить");
         x = gfx::hint(x, y, BTN_TRIANGLE, "Очистить готовые");
         gfx::hint(x, y, BTN_START, "Настройки");
+    } else if (screen == SCR_DETAIL && rel_sel >= 0) {
+        x = gfx::hint(x, y, ok_icon, "Открыть");
+        x = gfx::hint(x, y, back_icon, "Назад");
+        gfx::text(gfx::regular, x, y + 15, 14, col::MUTED, "↑ к кнопке установки");
     } else if (screen == SCR_DETAIL) {
         Status st = installed.status(detail);
         auto t = tasks.find(detail);
@@ -1140,9 +1557,19 @@ void App::draw_footer()
         x = gfx::hint(x, y, ok_icon, ok);
         if (st != ST_NONE && !busy)
             x = gfx::hint(x, y, BTN_SQUARE, "Переустановить");
+        if (detail.cat == CAT_GAMES && !busy)
+            x = gfx::hint(x, y, BTN_TRIANGLE, "В фоне");
+        if (has_saves)
+            x = gfx::hint(x, y, BTN_R, "Сохранения");
         x = gfx::hint(x, y, back_icon, "Назад");
-        if (detail.shots.size() > 1)
+        if (!related.empty())
+            gfx::text(gfx::regular, x, y + 15, 14, col::MUTED, "↓ связанное");
+        else if (detail.shots.size() > 1)
             gfx::text(gfx::regular, x, y + 15, 14, col::MUTED, "← → скриншоты");
+    } else if (screen == SCR_BACKUPS) {
+        x = gfx::hint(x, y, ok_icon, "Восстановить");
+        x = gfx::hint(x, y, BTN_TRIANGLE, "Удалить");
+        gfx::hint(x, y, back_icon, "Назад");
     } else {
         x = gfx::hint(x, y, ok_icon, "Выбрать");
         gfx::hint(x, y, back_icon, "Назад");
@@ -1175,8 +1602,22 @@ void App::draw_modal()
                         if (modal.action)
                             modal.action();
                     }});
+    float right = x + w - 28 - bw - 12;
+    if (!modal.alt.empty()) {
+        float aw = gfx::width(gfx::regular, 15, modal.alt) + 64;
+        float ax = right - aw;
+        gfx::rrect(ax, by, aw, 36, 18, col::SURFACE2);
+        gfx::button(BTN_TRIANGLE, ax + 12, by + 8, 20);
+        gfx::text(gfx::regular, ax + 42, by + 23, 15, col::TEXT, modal.alt);
+        hits.push_back({ax, by, aw, 36, [this]() {
+                            modal.on = false;
+                            if (modal.alt_action)
+                                modal.alt_action();
+                        }});
+        right = ax - 12;
+    }
     float cw = gfx::width(gfx::regular, 15, "Закрыть") + 60;
-    float cxp = x + w - 28 - bw - 12 - cw;
+    float cxp = right - cw;
     gfx::rrect(cxp, by, cw, 36, 18, col::SURFACE2);
     gfx::button(back_icon, cxp + 12, by + 8, 20);
     gfx::text(gfx::regular, cxp + 40, by + 23, 15, col::TEXT, "Закрыть");
@@ -1199,6 +1640,7 @@ void App::draw_toast()
 void App::draw()
 {
     hits.clear();
+    gfx::background();
     if (screen == SCR_BROWSE) {
         if (tab == TAB_DOWNLOADS)
             draw_downloads();
@@ -1207,6 +1649,8 @@ void App::draw()
         draw_header();
     } else if (screen == SCR_DETAIL) {
         draw_detail();
+    } else if (screen == SCR_BACKUPS) {
+        draw_backups();
     } else {
         draw_settings();
     }
@@ -1235,6 +1679,7 @@ void App::run()
     if (catalog.media.empty())
         catalog.media = settings.base() + "media/";
     catalog.load_pkgj();
+    catalog.apply_covers();
     rebuild();
     images.start();
     tasks.start(&installed);
@@ -1242,6 +1687,7 @@ void App::run()
 
     for (;;) {
         apply_refresh();
+        check_reboot();
         if (ime::active()) {
             std::string text;
             int r = ime::poll(text);
@@ -1257,6 +1703,8 @@ void App::run()
         static uint64_t last_refresh = 0;
         if (now_ms() - last_refresh > 2000) {
             installed.refresh();
+            if (screen == SCR_DETAIL)
+                check_deps();
             last_refresh = now_ms();
         }
 

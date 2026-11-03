@@ -48,6 +48,12 @@ std::vector<std::string> wrap(Font f, int size, const std::string& s, int maxw);
 void cover(vita2d_texture* t, float x, float y, float w, float h, float a = 1);
 void fit(vita2d_texture* t, float x, float y, float w, float h, float a = 1);
 
+void cover_round(vita2d_texture* t, float x, float y, float w, float h, float r, bool top, bool bottom, float a = 1);
+void fit_round(vita2d_texture* t, float x, float y, float w, float h, float r, float a = 1);
+void grad_round(float x, float y, float w, float h, float r, bool top, bool bottom, unsigned c1, unsigned c2);
+void background();
+void placeholder(float x, float y, float w, float h, const std::string& name, int size);
+void placeholder_round(float x, float y, float w, float h, float r, const std::string& name, int size);
 void button(Btn b, float x, float y, float size);
 float hint(float x, float y, Btn b, const std::string& label);
 void spinner(float x, float y, float r, unsigned c);

@@ -101,6 +101,8 @@ bool Catalog::parse(const std::string& json, std::string& err)
             e.zrif = str(v, "zrif");
             e.sha256 = str(v, "sha256");
             e.content = str(v, "content_id");
+            e.needs = str(v, "requires");
+            e.check = str(v, "check");
             e.size = v["size"].isNumeric() ? v["size"].asUInt64() : 0;
             e.icon = str(v, "icon");
             if (v["shots"].isArray())
@@ -172,8 +174,8 @@ bool pkgj_urls(std::string& games, std::string& dlcs)
     return !games.empty() || !dlcs.empty();
 }
 
-static const std::string PKGJ_GAMES = APP_DIR + "/pkgj_games.tsv";
-static const std::string PKGJ_DLCS = APP_DIR + "/pkgj_dlcs.tsv";
+#define PKGJ_GAMES (APP_DIR + "/pkgj_games.tsv")
+#define PKGJ_DLCS (APP_DIR + "/pkgj_dlcs.tsv")
 
 void pkgj_fetch(bool force)
 {
@@ -245,6 +247,32 @@ static int load_nps(std::vector<Entry>& out, const std::string& path, bool dlc)
         n++;
     }
     return n;
+}
+
+void Catalog::apply_covers()
+{
+    std::string text;
+    if (!fs::read(APP_DIR + "/covers.json", text))
+        return;
+    Json::CharReaderBuilder b;
+    Json::Value root;
+    std::string errs;
+    std::istringstream in(text);
+    if (!Json::parseFromStream(b, in, &root, &errs) || !root.isObject())
+        return;
+    for (auto& e : items[CAT_GAMES]) {
+        const Json::Value& v = root[e.id];
+        if (!v.isObject())
+            continue;
+        if (e.icon.empty())
+            e.icon = str(v, "c");
+        if (e.shots.empty() && v["s"].isArray())
+            for (const auto& s : v["s"])
+                if (s.isString())
+                    e.shots.push_back(s.asString());
+        if (e.description.empty())
+            e.description = str(v, "d");
+    }
 }
 
 void Catalog::load_pkgj()

@@ -1,5 +1,6 @@
 #include "tasks.hpp"
 
+#include "backup.hpp"
 #include "pkg.hpp"
 #include "promote.hpp"
 #include "util.hpp"
@@ -137,13 +138,29 @@ static bool tai_add(const std::string& section, const std::string& plugin, std::
     return true;
 }
 
+static std::vector<std::string> split(const std::string& s, char sep)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s + sep) {
+        if (c == sep) {
+            if (!trim(cur).empty())
+                out.push_back(trim(cur));
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    return out;
+}
+
 static std::string base_name(const std::string& p)
 {
     size_t s = p.rfind('/');
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
-static bool install_plugin_files(Task& t, const std::string& file, const std::string& section, std::string& err)
+static bool install_plugin_files(Task& t, const Entry& pe, const std::string& file, const std::string& section, std::string& err)
 {
     std::string dir = tai_dir();
     std::vector<std::string> placed;
@@ -160,13 +177,13 @@ static bool install_plugin_files(Task& t, const std::string& file, const std::st
         if (!ok)
             return false;
     } else {
-        std::string name = base_name(t.entry.url);
+        std::string name = base_name(split(pe.url, '|').empty() ? pe.url : split(pe.url, '|')[0]);
         size_t q = name.find('?');
         if (q != std::string::npos)
             name = name.substr(0, q);
         std::string l = lower(name);
         if (!ends_with(l, ".suprx") && !ends_with(l, ".skprx"))
-            name = t.entry.id + ".suprx";
+            name = pe.id + ".suprx";
         std::string out = dir + "/" + name;
         fs::mkdirs(dir);
         sceIoRemove(out.c_str());
@@ -192,6 +209,54 @@ static bool install_plugin_files(Task& t, const std::string& file, const std::st
     }
     std::lock_guard<std::mutex> lock(t.m);
     t.note = "Перезагрузи консоль, чтобы плагин включился";
+    t.reboot = true;
+    return true;
+}
+
+bool plugin_present(const Entry& p)
+{
+    std::string cfg;
+    for (const char* path : {"ux0:tai/config.txt", "ur0:tai/config.txt"}) {
+        std::string s;
+        if (fs::read(path, s))
+            cfg += lower(s) + "\n";
+    }
+    std::vector<std::string> keys = split(lower(p.check), '|');
+    if (keys.empty()) {
+        std::string name = base_name(split(p.url, '|').empty() ? p.url : split(p.url, '|')[0]);
+        size_t q = name.find('?');
+        keys.push_back(lower(q == std::string::npos ? name : name.substr(0, q)));
+    }
+    std::istringstream in(cfg);
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == '*')
+            continue;
+        for (auto& k : keys)
+            if (!k.empty() && line.find(k) != std::string::npos)
+                return true;
+    }
+    return false;
+}
+
+static bool install_deps(Task& t, std::string& err)
+{
+    for (auto& d : t.deps) {
+        if (plugin_present(d))
+            continue;
+        t.set_stage("Ставлю " + d.name);
+        std::string f = APP_DIR + "/dl/dep_" + hash_name(d.id + d.url);
+        bool ok = download(t, links(d.url, d.mirror), f, err) && install_plugin_files(t, d, f, d.tai_section, err);
+        sceIoRemove(f.c_str());
+        if (!ok) {
+            err = d.name + ": " + err;
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(t.m);
+        t.note = "Перезагрузи консоль, чтобы плагины включились";
+        t.reboot = true;
+    }
     return true;
 }
 
@@ -245,7 +310,7 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
     if (type == "data")
         return install_data(t, file, e.data_path, err);
     if (type == "plugin")
-        return install_plugin_files(t, file, e.id, err);
+        return install_plugin_files(t, e, file, e.id, err);
     if (!is_zip(file)) {
         err = "Перевод должен быть zip архивом";
         return false;
@@ -281,7 +346,7 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
         }
         if (has_tid)
             return "ux0:rePatch/" + n;
-        if (n.find('/') == std::string::npos && ends_with(l, ".txt"))
+        if (ends_with(l, ".txt") || ends_with(l, ".md"))
             return std::string();
         return "ux0:rePatch/" + e.id + "/" + n;
     });
@@ -293,6 +358,7 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
     if (!plugins.empty()) {
         std::lock_guard<std::mutex> lock(t.m);
         t.note = "Перезагрузи консоль, чтобы плагин включился";
+    t.reboot = true;
     }
     return true;
 }
@@ -303,7 +369,26 @@ void Tasks::run(Task& t)
     std::string err;
     std::string dl = APP_DIR + "/dl/" + std::string(category_key(e.cat)) + "_" + hash_name(e.id + e.url);
     bool ok = false;
-    if (e.cat == CAT_GAMES) {
+    bool deps_missing = false;
+    for (auto& d : t.deps)
+        if (!plugin_present(d))
+            deps_missing = true;
+    std::string berr;
+    if (e.cat == CAT_PLUGINS || deps_missing || (e.cat == CAT_TRANSLATIONS && lower(e.install).find("plugin") != std::string::npos)) {
+        t.set_stage("Резервная копия config.txt");
+        if (!backup_create("Перед установкой " + e.name + ": config.txt", {"ux0:tai/config.txt", "ur0:tai/config.txt"}, berr))
+            log_line("%s", berr.c_str());
+    }
+    if (e.cat == CAT_TRANSLATIONS) {
+        std::string rp = "ux0:rePatch/" + e.id;
+        if (fs::exists(rp) && tree_size(rp) < 300ull * 1024 * 1024) {
+            t.set_stage("Резервная копия rePatch");
+            if (!backup_create("Перед установкой " + e.name + ": rePatch/" + e.id, {rp}, berr))
+                log_line("%s", berr.c_str());
+        }
+    }
+    if (!install_deps(t, err)) {
+    } else if (e.cat == CAT_GAMES) {
         if (enough_space(e, 1.05, err)) {
             std::vector<std::string> urls = links(e.url, e.mirror);
             for (size_t i = 0; i < urls.size() && !ok; i++) {
@@ -320,9 +405,16 @@ void Tasks::run(Task& t)
         if (enough_space(e, 2.1, err) && download(t, links(e.url, e.data.empty() ? e.mirror : ""), dl, err)) {
             ok = install_vpk(t, dl, err);
             sceIoRemove(dl.c_str());
-            if (ok && !e.data.empty()) {
-                std::string dd = dl + "_data";
-                ok = download(t, links(e.data, e.mirror), dd, err) && install_data(t, dd, e.data_path, err);
+            std::vector<std::string> parts = split(e.data, ';');
+            for (size_t i = 0; ok && i < parts.size(); i++) {
+                std::string src = parts[i], dest = e.data_path;
+                size_t gt = src.find('>');
+                if (gt != std::string::npos) {
+                    dest = trim(src.substr(gt + 1));
+                    src = trim(src.substr(0, gt));
+                }
+                std::string dd = dl + "_data" + std::to_string(i);
+                ok = download(t, links(src, i == 0 ? e.mirror : ""), dd, err) && install_data(t, dd, dest, err);
                 sceIoRemove(dd.c_str());
             }
         }
@@ -350,7 +442,7 @@ void Tasks::run(Task& t)
         }
     } else if (e.cat == CAT_PLUGINS) {
         if (download(t, links(e.url, e.mirror), dl, err)) {
-            ok = install_plugin_files(t, dl, e.tai_section, err);
+            ok = install_plugin_files(t, e, dl, e.tai_section, err);
             sceIoRemove(dl.c_str());
         }
     }
@@ -419,7 +511,7 @@ void Tasks::stop()
     }
 }
 
-std::shared_ptr<Task> Tasks::add(const Entry& e)
+std::shared_ptr<Task> Tasks::add(const Entry& e, const std::vector<Entry>& deps)
 {
     std::lock_guard<std::mutex> lock(m);
     for (auto& t : tasks)
@@ -428,6 +520,7 @@ std::shared_ptr<Task> Tasks::add(const Entry& e)
             return t;
     auto t = std::make_shared<Task>();
     t->entry = e;
+    t->deps = deps;
     t->stage = "В очереди";
     tasks.push_back(t);
     return t;

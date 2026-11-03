@@ -23,6 +23,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wno-psabi")
 
 add_executable(vpkgj
   src/main.cpp
+  src/backup.cpp
+  src/bgdl.cpp
   src/catalog.cpp
   src/gfx.cpp
   src/headbin.cpp
@@ -80,6 +82,7 @@ target_link_libraries(vpkgj
   SceIofilemgr_stub
   SceProcessmgr_stub
   SceLibKernel_stub
+  taihen_stub
 )
 
 vita_create_self(eboot.bin vpkgj UNSAFE)
