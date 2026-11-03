@@ -1,0 +1,96 @@
+cmake_minimum_required(VERSION 3.16)
+
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+  if(DEFINED ENV{VITASDK})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "toolchain file")
+  else()
+    message(FATAL_ERROR "Please define VITASDK to point to your SDK path!")
+  endif()
+endif()
+
+project(VPKGJ CXX C)
+include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
+
+set(VITA_APP_NAME "VPKGJ")
+set(VITA_TITLEID "VPKG00001")
+set(VITA_VERSION "01.00")
+set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2 -Wall")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall -Wno-psabi")
+
+add_executable(vpkgj
+  src/main.cpp
+  src/catalog.cpp
+  src/gfx.cpp
+  src/headbin.cpp
+  src/images.cpp
+  src/ime.cpp
+  src/net.cpp
+  src/pkg.cpp
+  src/promote.cpp
+  src/tasks.cpp
+  src/util.cpp
+  src/zip.cpp
+)
+
+target_include_directories(vpkgj PRIVATE $ENV{VITASDK}/arm-vita-eabi/include/jsoncpp)
+target_link_options(vpkgj PRIVATE -Wl,--wrap,fcntl)
+
+target_link_libraries(vpkgj
+  vita2d
+  freetype
+  png
+  jpeg
+  jsoncpp
+  minizip
+  ppmd
+  curl
+  mbedtls
+  mbedx509
+  mbedcrypto
+  ssl
+  crypto
+  bz2
+  lzma
+  zstd
+  z
+  m
+  pthread
+  SceAppMgr_stub
+  SceAppUtil_stub
+  SceCommonDialog_stub
+  SceCtrl_stub
+  SceDisplay_stub
+  SceGxm_stub
+  SceIme_stub
+  SceNet_stub
+  SceNetCtl_stub
+  ScePgf_stub
+  ScePower_stub
+  ScePromoterUtil_stub
+  SceShellSvc_stub
+  SceSysmodule_stub
+  SceTouch_stub
+  SceRtc_stub
+  SceKernelThreadMgr_stub
+  SceKernelModulemgr_stub
+  SceIofilemgr_stub
+  SceProcessmgr_stub
+  SceLibKernel_stub
+)
+
+vita_create_self(eboot.bin vpkgj UNSAFE)
+
+vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
+  VERSION ${VITA_VERSION}
+  NAME ${VITA_APP_NAME}
+  FILE sce_sys/icon0.png sce_sys/icon0.png
+       sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+       sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+       sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
+       assets/Inter-Regular.ttf assets/Inter-Regular.ttf
+       assets/Inter-SemiBold.ttf assets/Inter-SemiBold.ttf
+)
