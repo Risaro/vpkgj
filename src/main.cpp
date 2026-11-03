@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 
@@ -45,8 +46,9 @@ static const int GAP_X = 18;
 static const int GAP_Y = 20;
 static const int GRID_X = (W - (COLS * CARD_W + (COLS - 1) * GAP_X)) / 2;
 static const int GRID_TOP = HEADER_H + 14;
-static const int TAB_DOWNLOADS = CAT_COUNT;
-static const int TAB_COUNT = CAT_COUNT + 1;
+static const int TAB_UPDATES = CAT_COUNT;
+static const int TAB_DOWNLOADS = CAT_COUNT + 1;
+static const int TAB_COUNT = CAT_COUNT + 2;
 
 enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS, SCR_BACKUPS };
 enum ImePurpose { IME_NONE, IME_SEARCH, IME_REPO, IME_BRANCH };
@@ -167,6 +169,26 @@ struct App {
     std::string icon_url(const Entry& e);
     Status status_of(const Entry& e);
     std::vector<Entry> collect_updates();
+    std::vector<Entry> collect_alt();
+    std::vector<Entry> upd;
+    std::vector<bool> upd_alt;
+    int upd_sel = 0;
+    void refresh_updates();
+    void draw_updates();
+    void input_updates(uint32_t act);
+    void ask_alt(const Entry& e);
+    bool ignored(const Entry& e, const std::string& version);
+    void ignore(const Entry& e, const std::string& version);
+    int sort_mode = 0;
+    int region_mode = 0;
+    bool only_ru = false;
+    bool only_installed = false;
+    bool hide_dlc = false;
+    bool filters_open = false;
+    int filter_sel = 0;
+    void draw_filters();
+    void input_filters(uint32_t act);
+    std::string filter_summary();
     void notify_updates();
     int updates_count = 0;
     std::vector<Entry>& list(int c) { return catalog.items[c]; }
@@ -220,16 +242,281 @@ void App::show_toast(const std::string& s)
     toast_until = now_ms() + 2600;
 }
 
+static const char* SORT_NAMES[] = {"Как в каталоге", "По названию", "Сначала большие", "Сначала маленькие"};
+static const char* REGION_NAMES[] = {"Все", "EU", "US", "JP", "ASIA"};
+
 void App::rebuild()
 {
     std::string q = lower(trim(query));
+    std::map<std::string, bool> tr;
+    for (auto& t : catalog.items[CAT_TRANSLATIONS])
+        tr[t.id] = true;
     for (int c = 0; c < CAT_COUNT; c++) {
         filtered[c].clear();
-        for (int i = 0; i < (int)catalog.items[c].size(); i++)
-            if (q.empty() || catalog.items[c][i].search.find(q) != std::string::npos)
-                filtered[c].push_back(i);
+        auto& items = catalog.items[c];
+        for (int i = 0; i < (int)items.size(); i++) {
+            const Entry& e = items[i];
+            if (!q.empty() && e.search.find(q) == std::string::npos)
+                continue;
+            if (region_mode && c == CAT_GAMES && e.region != REGION_NAMES[region_mode])
+                continue;
+            if (hide_dlc && e.dlc)
+                continue;
+            if (only_ru && lower(e.lang).find("ru") == std::string::npos && !tr.count(e.id))
+                continue;
+            if (only_installed && status_of(e) == ST_NONE)
+                continue;
+            filtered[c].push_back(i);
+        }
+        if (sort_mode) {
+            auto& f = filtered[c];
+            std::stable_sort(f.begin(), f.end(), [&](int a, int b) {
+                const Entry& x = items[a];
+                const Entry& y = items[b];
+                if (sort_mode == 1)
+                    return lower(x.name) < lower(y.name);
+                if (sort_mode == 2)
+                    return x.size > y.size;
+                return x.size < y.size;
+            });
+        }
         if (sel[c] >= (int)filtered[c].size())
             sel[c] = std::max(0, (int)filtered[c].size() - 1);
+    }
+}
+
+std::string App::filter_summary()
+{
+    std::string s;
+    auto add = [&](const std::string& x) { s += (s.empty() ? "" : " · ") + x; };
+    if (sort_mode)
+        add(SORT_NAMES[sort_mode]);
+    if (region_mode)
+        add(REGION_NAMES[region_mode]);
+    if (only_ru)
+        add("Есть русский");
+    if (only_installed)
+        add("Установленные");
+    if (hide_dlc)
+        add("Без DLC");
+    return s;
+}
+
+void App::input_filters(uint32_t act)
+{
+    if (act & SCE_CTRL_UP)
+        filter_sel = (filter_sel + 4) % 5;
+    if (act & SCE_CTRL_DOWN)
+        filter_sel = (filter_sel + 1) % 5;
+    int d = (act & SCE_CTRL_LEFT) ? -1 : (act & (SCE_CTRL_RIGHT | ok_btn)) ? 1 : 0;
+    if (d) {
+        if (filter_sel == 0)
+            sort_mode = (sort_mode + 4 + d) % 4;
+        else if (filter_sel == 1)
+            region_mode = (region_mode + 5 + d) % 5;
+        else if (filter_sel == 2)
+            only_ru = !only_ru;
+        else if (filter_sel == 3)
+            only_installed = !only_installed;
+        else
+            hide_dlc = !hide_dlc;
+        rebuild();
+        if (tab < CAT_COUNT) {
+            sel[tab] = 0;
+            scroll_target[tab] = 0;
+        }
+    }
+    if (pressed & SCE_CTRL_TRIANGLE) {
+        sort_mode = region_mode = 0;
+        only_ru = only_installed = hide_dlc = false;
+        rebuild();
+    }
+    if (pressed & (back_btn | SCE_CTRL_SELECT))
+        filters_open = false;
+}
+
+void App::draw_filters()
+{
+    gfx::rect(0, 0, W, H, gfx::alpha(RGBA8(0, 0, 0, 255), 0.55f));
+    float w = 520, h = 330, x = (W - w) / 2, y = (H - h) / 2 - 10;
+    gfx::rrect(x, y, w, h, 20, col::SURFACE);
+    gfx::text(gfx::bold, x + 28, y + 42, 20, col::TEXT, "Сортировка и фильтры");
+    struct Row {
+        std::string title, value;
+    } rows[] = {
+        {"Сортировка", SORT_NAMES[sort_mode]},
+        {"Регион игр", REGION_NAMES[region_mode]},
+        {"Только с русским языком", only_ru ? "да" : "нет"},
+        {"Только установленные", only_installed ? "да" : "нет"},
+        {"Скрыть DLC", hide_dlc ? "да" : "нет"},
+    };
+    for (int i = 0; i < 5; i++) {
+        float ry = y + 64 + i * 48;
+        bool on = i == filter_sel;
+        gfx::rrect(x + 16, ry, w - 32, 40, 10, on ? col::SURFACE2 : gfx::alpha(col::SURFACE2, 0.4f));
+        if (on)
+            gfx::rframe(x + 16, ry, w - 32, 40, 10, 2, col::ACCENT);
+        gfx::text(gfx::regular, x + 32, ry + 26, 15, col::TEXT, rows[i].title);
+        std::string v = "‹ " + rows[i].value + " ›";
+        gfx::text_right(gfx::bold, x + w - 32, ry + 26, 15, on ? col::ACCENT : col::MUTED, v);
+        int idx = i;
+        hits.push_back({x + 16, ry, w - 32, 40, [this, idx]() {
+                            filter_sel = idx;
+                            input_filters(SCE_CTRL_RIGHT);
+                        }});
+    }
+}
+
+bool App::ignored(const Entry& e, const std::string& version)
+{
+    std::string s;
+    fs::read(APP_DIR + "/ignored.txt", s);
+    return s.find(std::string(category_key(e.cat)) + "/" + e.id + "/" + version + "\n") != std::string::npos;
+}
+
+void App::ignore(const Entry& e, const std::string& version)
+{
+    std::string s;
+    fs::read(APP_DIR + "/ignored.txt", s);
+    fs::write(APP_DIR + "/ignored.txt", s + category_key(e.cat) + "/" + e.id + "/" + version + "\n");
+}
+
+std::vector<Entry> App::collect_alt()
+{
+    std::vector<Entry> out;
+    for (int c : {CAT_PORTS, CAT_HOMEBREW}) {
+        for (auto& e : catalog.items[c]) {
+            if (e.alt_url.empty() || e.alt_version.empty() || installed.status(e) == ST_NONE)
+                continue;
+            std::string cur = installed.version_of(e);
+            if (cur.empty() || cur == "-")
+                cur = e.version;
+            if (version_cmp(cur, e.alt_version) < 0 && version_cmp(e.version, e.alt_version) < 0 && !ignored(e, e.alt_version))
+                out.push_back(e);
+        }
+    }
+    return out;
+}
+
+void App::refresh_updates()
+{
+    upd.clear();
+    upd_alt.clear();
+    for (auto& e : collect_updates()) {
+        upd.push_back(e);
+        upd_alt.push_back(false);
+    }
+    for (auto& e : collect_alt()) {
+        upd.push_back(e);
+        upd_alt.push_back(true);
+    }
+    updates_count = 0;
+    for (size_t i = 0; i < upd.size(); i++)
+        if (!upd_alt[i])
+            updates_count++;
+    if (upd_sel >= (int)upd.size())
+        upd_sel = std::max(0, (int)upd.size() - 1);
+}
+
+void App::ask_alt(const Entry& e)
+{
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Версия " + e.alt_version + " из стороннего источника";
+    modal.lines.push_back("Источник: " + (e.alt_source.empty() ? std::string("GitHub автора") : e.alt_source));
+    modal.lines.push_back("Основная версия в каталоге: " + e.version);
+    modal.lines.push_back("Может слететь русификатор или игра перестанет запускаться.");
+    modal.lines.push_back("Ставишь на свой риск. Вернуть основную: □ Переустановить.");
+    modal.yes = "Поставить на свой риск";
+    Entry alt = e;
+    alt.url = e.alt_url;
+    alt.mirror = "";
+    alt.version = e.alt_version;
+    alt.name = e.name + " " + e.alt_version;
+    std::vector<Entry> deps = deps_of(e);
+    modal.action = [this, alt, deps]() {
+        tasks.add(alt, deps);
+        show_toast("Добавлено в загрузки");
+    };
+}
+
+void App::input_updates(uint32_t act)
+{
+    int n = (int)upd.size();
+    if (act & SCE_CTRL_UP)
+        upd_sel = std::max(0, upd_sel - 1);
+    if (act & SCE_CTRL_DOWN)
+        upd_sel = std::min(std::max(0, n - 1), upd_sel + 1);
+    if ((pressed & ok_btn) && upd_sel < n) {
+        if (upd_alt[upd_sel])
+            ask_alt(upd[upd_sel]);
+        else
+            ask_install(upd[upd_sel], false);
+    }
+    if ((pressed & SCE_CTRL_SQUARE) && updates_count) {
+        int k = 0;
+        for (int i = 0; i < n; i++)
+            if (!upd_alt[i]) {
+                tasks.add(upd[i], deps_of(upd[i]));
+                k++;
+            }
+        show_toast("В очередь добавлено обновлений: " + std::to_string(k));
+    }
+    if ((pressed & SCE_CTRL_TRIANGLE) && upd_sel < n) {
+        const Entry& e = upd[upd_sel];
+        ignore(e, upd_alt[upd_sel] ? e.alt_version : e.version);
+        show_toast("Это обновление больше не будет показываться");
+        refresh_updates();
+    }
+}
+
+void App::draw_updates()
+{
+    if (upd.empty()) {
+        gfx::text_center(gfx::bold, W / 2, 270, 20, col::TEXT, "Всё обновлено");
+        gfx::text_center(gfx::regular, W / 2, 298, 15, col::MUTED, "Когда выйдут новые версии, они появятся здесь");
+        return;
+    }
+    float y = GRID_TOP + 4;
+    gfx::text(gfx::regular, 32, y + 12, 14, col::MUTED,
+              "Обновлений: " + std::to_string(updates_count) + (upd.size() > (size_t)updates_count ? " · сторонних версий: " + std::to_string(upd.size() - updates_count) : ""));
+    y += 28;
+    int first = std::max(0, upd_sel - 4);
+    for (int i = first; i < (int)upd.size() && y < FOOTER_Y - 70; i++) {
+        const Entry& e = upd[i];
+        bool on = i == upd_sel;
+        bool alt = upd_alt[i];
+        gfx::rrect(28, y, W - 56, 72, 14, on ? col::SURFACE2 : col::SURFACE);
+        if (on)
+            gfx::rframe(28, y, W - 56, 72, 14, 2, alt ? col::ORANGE : col::ACCENT);
+        float a = 0;
+        vita2d_texture* ic = images.get(icon_url(e), &a);
+        if (ic)
+            gfx::fit_round(ic, 42, y + 12, 48, 48, 10, a);
+        else
+            gfx::placeholder_round(42, y + 12, 48, 48, 10, e.name, 16);
+        gfx::text(gfx::bold, 106, y + 30, 16, col::TEXT, gfx::ellipsize(gfx::bold, 16, e.name, 560));
+        std::string from = e.cat == CAT_GAMES ? catalog.game_versions[e.id] : installed.version_of(e);
+        if (from.empty() || from == "-")
+            from = "?";
+        std::string to = alt ? e.alt_version : e.version;
+        std::string sub = std::string(category_title(e.cat)) + " · " + from + " → " + to + (e.size ? " · " + fmt_size(e.size) : "");
+        gfx::text(gfx::regular, 106, y + 52, 13, col::MUTED, gfx::ellipsize(gfx::regular, 13, sub, 560));
+        if (alt)
+            draw_badge(W - 46, y + 26, "Сторонний источник, на свой риск", col::ORANGE, col::BG);
+        else
+            draw_badge(W - 46, y + 26, "Обновление", col::ACCENT, col::TEXT);
+        int idx = i;
+        hits.push_back({28, y, (float)(W - 56), 72, [this, idx]() {
+                            if (upd_sel == idx) {
+                                if (upd_alt[idx])
+                                    ask_alt(upd[idx]);
+                                else
+                                    ask_install(upd[idx], false);
+                            }
+                            upd_sel = idx;
+                        }});
+        y += 82;
     }
 }
 
@@ -287,12 +574,12 @@ std::vector<Entry> App::collect_updates()
         if (c == CAT_GAMES)
             continue;
         for (auto& e : catalog.items[c])
-            if (installed.status(e) == ST_UPDATE)
+            if (installed.status(e) == ST_UPDATE && !ignored(e, e.version))
                 out.push_back(e);
     }
     for (auto& kv : catalog.game_versions) {
         auto p = catalog.patches.find(kv.first);
-        if (p != catalog.patches.end() && version_cmp(kv.second, p->second.version) < 0)
+        if (p != catalog.patches.end() && version_cmp(kv.second, p->second.version) < 0 && !ignored(p->second, p->second.version))
             out.push_back(p->second);
     }
     return out;
@@ -301,7 +588,7 @@ std::vector<Entry> App::collect_updates()
 void App::notify_updates()
 {
     auto ups = collect_updates();
-    updates_count = (int)ups.size();
+    refresh_updates();
     if (ups.empty())
         return;
     std::string seen;
@@ -413,6 +700,8 @@ void App::apply_refresh()
 void App::set_tab(int t)
 {
     tab = (t + TAB_COUNT) % TAB_COUNT;
+    if (tab == TAB_UPDATES)
+        refresh_updates();
     focus_init = false;
 }
 
@@ -789,8 +1078,20 @@ void App::input()
             set_tab(tab - 1);
         if (pressed & SCE_CTRL_RTRIGGER)
             set_tab(tab + 1);
-        if (pressed & (SCE_CTRL_START | SCE_CTRL_SELECT)) {
+        if (filters_open) {
+            input_filters(act);
+            return;
+        }
+        if (pressed & SCE_CTRL_START) {
             screen = SCR_SETTINGS;
+            return;
+        }
+        if ((pressed & SCE_CTRL_SELECT) && tab < CAT_COUNT) {
+            filters_open = true;
+            return;
+        }
+        if (tab == TAB_UPDATES) {
+            input_updates(act);
             return;
         }
         if (tab == TAB_DOWNLOADS) {
@@ -913,6 +1214,8 @@ void App::input()
             primary_action();
         if ((pressed & SCE_CTRL_TRIANGLE) && detail.cat == CAT_GAMES)
             background_download(detail);
+        else if ((pressed & SCE_CTRL_TRIANGLE) && !detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0)
+            ask_alt(detail);
         if ((pressed & SCE_CTRL_RTRIGGER) && has_saves)
             saves_menu(detail);
         if ((pressed & SCE_CTRL_SQUARE) && installed.status(detail) != ST_NONE) {
@@ -1043,10 +1346,10 @@ void App::draw_header()
     gfx::button(BTN_L, x, 23, 20);
     x += 34;
     for (int t = 0; t < TAB_COUNT; t++) {
-        std::string label = t == TAB_DOWNLOADS ? "Загрузки" : category_title((Category)t);
+        std::string label = t == TAB_DOWNLOADS ? "Загрузки" : t == TAB_UPDATES ? "Обновления" : category_title((Category)t);
         if (!query.empty() && t < CAT_COUNT)
             label += " " + std::to_string(filtered[t].size());
-        int n = t == TAB_DOWNLOADS ? tasks.active() : 0;
+        int n = t == TAB_DOWNLOADS ? tasks.active() : t == TAB_UPDATES ? updates_count : 0;
         int tw = gfx::width(gfx::bold, 15, label);
         float w = tw + 28 + (n ? 26 : 0);
         bool on = t == tab;
@@ -1144,6 +1447,9 @@ void App::draw_grid()
         if (refreshing == 1 && !loaded_once) {
             gfx::spinner(W / 2, cy - 20, 12, col::ACCENT);
             gfx::text_center(gfx::regular, W / 2, cy + 22, 16, col::MUTED, "Загружаю каталог...");
+        } else if (!filter_summary().empty()) {
+            gfx::text_center(gfx::bold, W / 2, cy, 20, col::TEXT, "Под фильтры ничего не подходит");
+            gfx::text_center(gfx::regular, W / 2, cy + 28, 15, col::MUTED, filter_summary() + " · SELECT, чтобы изменить");
         } else if (!query.empty()) {
             gfx::text_center(gfx::bold, W / 2, cy, 20, col::TEXT, "Ничего не нашлось");
             gfx::text_center(gfx::regular, W / 2, cy + 28, 15, col::MUTED, "Поиск: " + query);
@@ -1195,6 +1501,12 @@ void App::draw_grid()
                         }});
     }
     vita2d_disable_clipping();
+    std::string fs_ = filter_summary();
+    if (!fs_.empty()) {
+        int w = gfx::width(gfx::regular, 13, fs_) + 24;
+        gfx::rrect(24, FOOTER_Y - 34, w, 26, 13, gfx::alpha(col::ACCENT, 0.9f));
+        gfx::text(gfx::regular, 36, FOOTER_Y - 16, 13, col::TEXT, fs_);
+    }
     if (!query.empty()) {
         std::string q = "Поиск: " + query;
         int w = gfx::width(gfx::regular, 13, q) + 24;
@@ -1348,6 +1660,8 @@ void App::draw_detail()
     for (size_t i = 0; i < detail_deps.size(); i++)
         chip(detail_deps[i].name + (detail_dep_ok[i] ? ": есть" : detail_deps[i].url.empty() ? ": нет, см. описание" : ": поставится сам"),
              detail_dep_ok[i] ? col::GREEN : detail_deps[i].url.empty() ? col::RED : col::ORANGE);
+    if (!e.alt_url.empty() && version_cmp(e.version, e.alt_version) < 0)
+        chip("Есть новее у автора: " + e.alt_version + " (△, на свой риск)", col::ORANGE);
     if (st == ST_INSTALLED)
         chip("Установлено", col::GREEN);
     if (st == ST_UPDATE)
@@ -1499,10 +1813,10 @@ void App::check_reboot()
             daemon_notify("Установлено: " + t->entry.name);
             if (t->entry.cat == CAT_GAMES) {
                 catalog.load_updates();
-                updates_count = (int)collect_updates().size();
+                refresh_updates();
             } else {
                 installed.refresh();
-                updates_count = (int)collect_updates().size();
+                refresh_updates();
             }
         }
         if (t->state == TS_DONE && t->reboot && !t->notified) {
@@ -1799,9 +2113,24 @@ void App::draw_footer()
         gfx::hint(x, y, back_icon, "Закрыть");
         return;
     }
+    if (screen == SCR_BROWSE && filters_open) {
+        x = gfx::hint(x, y, ok_icon, "Изменить");
+        x = gfx::hint(x, y, BTN_TRIANGLE, "Сбросить всё");
+        gfx::hint(x, y, back_icon, "Закрыть");
+        return;
+    }
+    if (screen == SCR_BROWSE && tab == TAB_UPDATES) {
+        x = gfx::hint(x, y, ok_icon, "Обновить");
+        if (updates_count)
+            x = gfx::hint(x, y, BTN_SQUARE, "Обновить всё");
+        x = gfx::hint(x, y, BTN_TRIANGLE, "Пропустить версию");
+        gfx::hint(x, y, BTN_START, "Настройки");
+        return;
+    }
     if (screen == SCR_BROWSE && tab < CAT_COUNT) {
         x = gfx::hint(x, y, ok_icon, "Открыть");
         x = gfx::hint(x, y, BTN_TRIANGLE, "Поиск");
+        x = gfx::hint(x, y, BTN_SELECT, "Фильтры");
         x = gfx::hint(x, y, BTN_SQUARE, "Обновить");
         if (!query.empty())
             x = gfx::hint(x, y, back_icon, "Сбросить поиск");
@@ -1826,6 +2155,8 @@ void App::draw_footer()
             x = gfx::hint(x, y, BTN_SQUARE, "Переустановить");
         if (detail.cat == CAT_GAMES && !busy)
             x = gfx::hint(x, y, BTN_TRIANGLE, "В фоне");
+        else if (!detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0 && !busy)
+            x = gfx::hint(x, y, BTN_TRIANGLE, "Версия " + detail.alt_version);
         if (has_saves)
             x = gfx::hint(x, y, BTN_R, "Сохранения");
         x = gfx::hint(x, y, back_icon, "Назад");
@@ -1913,9 +2244,15 @@ void App::draw()
     if (screen == SCR_BROWSE) {
         if (tab == TAB_DOWNLOADS)
             draw_downloads();
+        else if (tab == TAB_UPDATES)
+            draw_updates();
         else
             draw_grid();
         draw_header();
+        if (filters_open) {
+            hits.clear();
+            draw_filters();
+        }
     } else if (screen == SCR_DETAIL && viewer) {
         draw_viewer();
         draw_toast();

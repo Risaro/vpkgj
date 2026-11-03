@@ -103,6 +103,9 @@ bool Catalog::parse(const std::string& json, std::string& err)
             e.zrif = str(v, "zrif");
             e.sha256 = str(v, "sha256");
             e.content = str(v, "content_id");
+            e.alt_url = str(v, "alt_vpk");
+            e.alt_version = str(v, "alt_version");
+            e.alt_source = str(v, "alt_source");
             e.needs = str(v, "requires");
             e.check = str(v, "check");
             e.size = v["size"].isNumeric() ? v["size"].asUInt64() : 0;
@@ -444,13 +447,20 @@ Status Installed::status(const Entry& e)
             return ST_NONE;
         if (e.cat == CAT_GAMES)
             return ST_INSTALLED;
-        if (recorded && it->second != (e.version.empty() ? "-" : e.version))
+        if (recorded && it->second != (e.version.empty() ? "-" : e.version) && it->second != e.alt_version)
             return ST_UPDATE;
         return ST_INSTALLED;
     }
     if (!recorded)
         return ST_NONE;
-    if (it->second != (e.version.empty() ? "-" : e.version))
+    if (it->second != (e.version.empty() ? "-" : e.version) && it->second != e.alt_version)
         return ST_UPDATE;
     return ST_INSTALLED;
+}
+
+std::string Installed::version_of(const Entry& e)
+{
+    std::lock_guard<std::mutex> lock(m);
+    auto it = versions.find(key(e));
+    return it == versions.end() ? "" : it->second;
 }

@@ -28,6 +28,9 @@ struct Entry {
     std::string sha256;
     std::string content;
     std::string needs;
+    std::string alt_url;
+    std::string alt_version;
+    std::string alt_source;
     std::string check;
     bool dlc = false;
     uint64_t size = 0;
@@ -72,6 +75,7 @@ public:
     void set(const Entry& e);
     void remove(const Entry& e);
     Status status(const Entry& e);
+    std::string version_of(const Entry& e);
     void refresh();
 
 private:

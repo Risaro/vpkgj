@@ -11,6 +11,25 @@
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
+#include <mutex>
+#include <netdb.h>
+
+static std::mutex resolve_lock;
+
+extern "C" int __real_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
+extern "C" void __real_freeaddrinfo(struct addrinfo*);
+
+extern "C" int __wrap_getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res)
+{
+    std::lock_guard<std::mutex> lock(resolve_lock);
+    return __real_getaddrinfo(node, service, hints, res);
+}
+
+extern "C" void __wrap_freeaddrinfo(struct addrinfo* ai)
+{
+    std::lock_guard<std::mutex> lock(resolve_lock);
+    __real_freeaddrinfo(ai);
+}
 
 extern "C" int __wrap_fcntl(int, int cmd, ...)
 {
@@ -77,6 +96,7 @@ static CURL* make(const std::string& url, Ctx& ctx)
 {
     CURL* h = curl_easy_init();
     curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(h, CURLOPT_USERAGENT, "VPKGJ/1.0 (PS Vita)");
     curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
