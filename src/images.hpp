@@ -51,7 +51,8 @@ public:
     void tick();
     void clear_disk();
     void set_busy(bool b) { busy = b; }
-    void preload(const std::vector<std::string>& urls, const std::string& media);
+    void preload(const std::vector<std::string>& urls, const std::string& media, const std::string& pack_id);
+    void set_media(const std::string& media);
     void preload_stop();
     bool cached(const std::string& url);
     Preload pre;
@@ -73,8 +74,8 @@ private:
     static int preload_worker(unsigned int, void* arg);
     static int preload_main(unsigned int, void* arg);
     void spawn_workers();
-    bool unpack(const std::string& zip);
     std::string pre_media;
+    std::string pre_pack_id;
     Mutex pre_m;
     std::vector<std::string> pre_urls;
     size_t pre_next = 0;

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <ctime>
 #include <sstream>
 
 const char* category_key(Category c)
@@ -211,9 +212,16 @@ void pkgj_fetch(bool force)
     if (!dlcs.empty() && (force || !fs::exists(PKGJ_DLCS)))
         if (!net::fetch(dlcs, PKGJ_DLCS, nullptr, err))
             log_line("pkgj dlcs list: %s", err.c_str());
-    if (!pkgj_updates_url.empty())
-        if (!net::fetch(pkgj_updates_url, PKGJ_UPDATES, nullptr, err))
+    std::string stamp;
+    fs::read(APP_DIR + "/pkgj_updates.time", stamp);
+    uint64_t at = strtoull(stamp.c_str(), nullptr, 10), now = (uint64_t)time(nullptr);
+    bool fresh = fs::exists(PKGJ_UPDATES) && at && now >= at && now - at < 12 * 3600;
+    if (!pkgj_updates_url.empty() && (force || !fresh)) {
+        if (net::fetch(pkgj_updates_url, PKGJ_UPDATES, nullptr, err))
+            fs::write(APP_DIR + "/pkgj_updates.time", std::to_string(now));
+        else
             log_line("pkgj updates list: %s", err.c_str());
+    }
 }
 
 static std::vector<std::string> split_tab(const std::string& line)

@@ -59,6 +59,7 @@ public:
     std::vector<Entry> items[CAT_COUNT];
     std::string version;
     std::string media;
+    std::string pack_id;
     std::string app_version;
     std::string app_url;
     std::string app_notes;

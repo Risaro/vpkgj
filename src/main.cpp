@@ -26,6 +26,7 @@
 #include <json/json.h>
 
 #include <algorithm>
+#include <ctime>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -891,22 +892,55 @@ int App::refresh_thread(unsigned int, void* arg)
     std::string body, err;
     std::string base = a->settings.base();
     std::unique_ptr<Catalog> c(new Catalog());
+    std::string old_body;
+    fs::read(APP_DIR + "/index.json", old_body);
     bool ok = net::get(base + "index.json", body, err) && c->parse(body, err);
-    if (ok)
+    bool same = ok && body == old_body;
+    if (ok && !same)
         fs::write(APP_DIR + "/index.json", body);
-    else
+    else if (!ok)
         c->load_cache();
     if (c->media.empty())
         c->media = base + "media/";
+    {
+        std::string pid, perr;
+        if (net::get(c->media + "pack.txt", pid, perr) && pid.size() < 200) {
+            c->pack_id = trim(pid);
+            fs::write(APP_DIR + "/pack.txt", c->pack_id);
+        } else {
+            fs::read(APP_DIR + "/pack.txt", c->pack_id);
+            c->pack_id = trim(c->pack_id);
+        }
+    }
     pkgj_fetch(a->manual_refresh);
     std::string covers;
-    if ((a->manual_refresh || !fs::exists(APP_DIR + "/covers.json") || ok) && net::get(base + "covers.json", covers, err) && covers.size() > 2 && covers[0] == '{')
+    if ((a->manual_refresh || !fs::exists(APP_DIR + "/covers.json") || (ok && !same)) && net::get(base + "covers.json", covers, err) && covers.size() > 2 && covers[0] == '{')
         fs::write(APP_DIR + "/covers.json", covers);
     c->load_pkgj();
     c->apply_covers();
     c->load_updates();
     c->prepare();
-    if (c->app_url.empty()) {
+    std::string relc;
+    fs::read(APP_DIR + "/app_rel.txt", relc);
+    uint64_t rel_at = strtoull(relc.c_str(), nullptr, 10);
+    uint64_t now_s = (uint64_t)time(nullptr);
+    if (c->app_url.empty() && !a->manual_refresh && rel_at && now_s >= rel_at && now_s - rel_at < 6 * 3600) {
+        std::vector<std::string> parts;
+        size_t pp = 0;
+        while (pp <= relc.size()) {
+            size_t nl = relc.find('\n', pp);
+            parts.push_back(relc.substr(pp, nl == std::string::npos ? std::string::npos : nl - pp));
+            if (nl == std::string::npos)
+                break;
+            pp = nl + 1;
+        }
+        if (parts.size() >= 3) {
+            c->app_version = parts[1];
+            c->app_url = parts[2];
+            for (size_t i = 3; i < parts.size(); i++)
+                c->app_notes += (i > 3 ? "\n" : "") + parts[i];
+        }
+    } else if (c->app_url.empty()) {
         std::string rel, rerr;
         if (net::get("https://api.github.com/repos/" APP_REPO "/releases/latest", rel, rerr)) {
             Json::CharReaderBuilder rb;
@@ -928,6 +962,7 @@ int App::refresh_thread(unsigned int, void* arg)
                     c->app_version = tag;
                     c->app_notes = root["body"].isString() ? root["body"].asString() : "";
                 }
+                fs::write(APP_DIR + "/app_rel.txt", std::to_string(now_s) + "\n" + c->app_version + "\n" + c->app_url + "\n" + c->app_notes);
             }
         }
     }
@@ -961,6 +996,7 @@ void App::apply_refresh()
         bool changed = fresh->version != catalog.version;
         catalog = std::move(*fresh);
         fresh.reset();
+        images.set_media(catalog.media);
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
         notify_updates();
@@ -968,10 +1004,15 @@ void App::apply_refresh()
             pre_checked = true;
             std::string mark;
             fs::read(APP_DIR + "/preload.txt", mark);
-            if (loaded_once && trim(mark) != catalog.media + "|" + catalog.version)
+            if (loaded_once && trim(mark) != catalog.media + "|" + catalog.version + "|" + catalog.pack_id)
                 start_preload();
             else
                 screen = SCR_BROWSE;
+        } else if (screen != SCR_PRELOAD && images.pre.running == 0 && refresh_err.empty()) {
+            std::string mark;
+            fs::read(APP_DIR + "/preload.txt", mark);
+            if (trim(mark) != catalog.media + "|" + catalog.version + "|" + catalog.pack_id)
+                start_preload();
         }
         if (!app_prompted)
             ask_app_update(false);
@@ -2718,12 +2759,13 @@ void App::start_preload()
             if (!e.shots.empty())
                 urls.push_back(catalog.media_url(e.shots[0]));
         }
-    images.preload(urls, catalog.media);
+    images.set_media(catalog.media);
+    images.preload(urls, catalog.media, catalog.pack_id);
     pre_t = now_ms();
     pre_b = 0;
     pre_speed = 0;
     if (images.pre.total == 0) {
-        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version);
+        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version + "|" + catalog.pack_id);
         if (screen == SCR_PRELOAD)
             screen = SCR_BROWSE;
         return;
@@ -2737,7 +2779,7 @@ void App::input_preload()
     if (!pre_checked || p.running != 0)
         return;
     if (p.failed == 0)
-        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version);
+        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version + "|" + catalog.pack_id);
     screen = SCR_BROWSE;
     show_toast(p.failed ? "Готово, не скачалось: " + std::to_string(p.failed.load()) + ", докачаю при следующем запуске" : "Все обложки скачаны");
 }
@@ -2799,7 +2841,7 @@ void App::draw_preload()
         } else {
             int ut = std::max(1, p.unpack_total.load()), ud = std::min(p.unpacked.load(), ut);
             float f = (float)ud / ut;
-            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Раскладываю картинки по кешу");
+            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Подготавливаю архив");
             gfx::rrect(bx, by, bw, 18, 9, col::SURFACE2);
             if (f > 0)
                 gfx::rrect(bx, by, std::max(18.0f, bw * f), 18, 9, col::ACCENT2);
@@ -3073,11 +3115,17 @@ void App::run()
         loaded_once = true;
     if (catalog.media.empty())
         catalog.media = settings.base() + "media/";
+    fs::read(APP_DIR + "/pack.txt", catalog.pack_id);
+    catalog.pack_id = trim(catalog.pack_id);
     catalog.load_pkgj();
     catalog.apply_covers();
     catalog.load_updates();
     catalog.prepare();
     load_views();
+    if (loaded_once) {
+        pre_checked = true;
+        screen = SCR_BROWSE;
+    }
     load_prefs();
     apply_speed();
     rebuild();
@@ -3087,6 +3135,13 @@ void App::run()
             fs::write(DAEMON_PATH, a);
     }
     images.start();
+    images.set_media(catalog.media);
+    if (pre_checked) {
+        std::string mark;
+        fs::read(APP_DIR + "/preload.txt", mark);
+        if (trim(mark) != catalog.media + "|" + catalog.version + "|" + catalog.pack_id)
+            start_preload();
+    }
     tasks.start(&installed);
     start_refresh(false);
 

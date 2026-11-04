@@ -273,6 +273,80 @@ static bool read_pak(const std::string& name, std::vector<uint8_t>& buf)
     return r == (int)buf.size();
 }
 
+static Mutex mpack_lock;
+static unzFile mpack = nullptr;
+static std::string mpack_prefix;
+static std::unordered_map<std::string, unz64_file_pos> mpack_index;
+#define MPACK (APP_DIR + "/media_pack.zip")
+
+static void mpack_close()
+{
+    std::lock_guard<Mutex> lock(mpack_lock);
+    if (mpack)
+        unzClose(mpack);
+    mpack = nullptr;
+    mpack_index.clear();
+}
+
+static int mpack_open(std::atomic<int>* done, std::atomic<int>* total)
+{
+    unzFile z = unzOpen64(MPACK.c_str());
+    if (!z)
+        return 0;
+    std::unordered_map<std::string, unz64_file_pos> idx;
+    unz_global_info64 gi;
+    if (total && unzGetGlobalInfo64(z, &gi) == UNZ_OK)
+        *total = (int)gi.number_entry;
+    if (unzGoToFirstFile(z) == UNZ_OK) {
+        do {
+            char n[512];
+            unz64_file_pos pos;
+            unz_file_info64 fi;
+            if (unzGetCurrentFileInfo64(z, &fi, n, sizeof(n), nullptr, 0, nullptr, 0) == UNZ_OK && unzGetFilePos64(z, &pos) == UNZ_OK)
+                idx[n] = pos;
+            if (done)
+                (*done)++;
+        } while (unzGoToNextFile(z) == UNZ_OK);
+    }
+    std::lock_guard<Mutex> lock(mpack_lock);
+    if (mpack)
+        unzClose(mpack);
+    mpack = z;
+    mpack_index.swap(idx);
+    return (int)mpack_index.size();
+}
+
+static bool mpack_has(const std::string& url)
+{
+    std::lock_guard<Mutex> lock(mpack_lock);
+    return mpack && !mpack_prefix.empty() && starts_with(url, mpack_prefix) && mpack_index.count(url.substr(mpack_prefix.size()));
+}
+
+static bool read_mpack(const std::string& url, std::vector<uint8_t>& buf)
+{
+    std::lock_guard<Mutex> lock(mpack_lock);
+    if (!mpack || mpack_prefix.empty() || !starts_with(url, mpack_prefix))
+        return false;
+    auto it = mpack_index.find(url.substr(mpack_prefix.size()));
+    if (it == mpack_index.end() || unzGoToFilePos64(mpack, &it->second) != UNZ_OK)
+        return false;
+    unz_file_info64 info;
+    if (unzGetCurrentFileInfo64(mpack, &info, nullptr, 0, nullptr, 0, nullptr, 0) != UNZ_OK || info.uncompressed_size > 16u * 1024 * 1024)
+        return false;
+    if (unzOpenCurrentFile(mpack) != UNZ_OK)
+        return false;
+    buf.resize((size_t)info.uncompressed_size);
+    int r = unzReadCurrentFile(mpack, buf.data(), (unsigned)buf.size());
+    unzCloseCurrentFile(mpack);
+    return r == (int)buf.size();
+}
+
+void Images::set_media(const std::string& media)
+{
+    std::lock_guard<Mutex> lock(mpack_lock);
+    mpack_prefix = media;
+}
+
 static bool read_file(const std::string& path, std::vector<uint8_t>& buf)
 {
     SceUID f = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
@@ -299,6 +373,7 @@ static bool read_file(const std::string& path, std::vector<uint8_t>& buf)
 void Images::start()
 {
     fs::mkdirs(CACHE);
+    mpack_open(nullptr, nullptr);
     quit = false;
     Images* self = this;
     for (int i = 0; i < DECODE_THREADS; i++) {
@@ -346,6 +421,7 @@ void Images::stop()
     to_free.clear();
     total = 0;
     images_close_pak();
+    mpack_close();
 }
 
 Image* Images::request(const std::string& url, int size, bool visible)
@@ -501,7 +577,7 @@ int Images::decode_worker(unsigned int, void* arg)
         if (starts_with(job.url, "pak:")) {
             have = read_pak(job.url.substr(4), buf);
         } else if (remote(job.url)) {
-            have = read_file(disk_path(job.url), buf);
+            have = read_mpack(job.url, buf) || read_file(disk_path(job.url), buf);
             net = !have;
         } else {
             have = read_file(job.url, buf);
@@ -632,10 +708,10 @@ void Images::tick()
 
 bool Images::cached(const std::string& url)
 {
-    return !remote(url) || fs::exists(disk_path(url));
+    return !remote(url) || mpack_has(url) || fs::exists(disk_path(url));
 }
 
-void Images::preload(const std::vector<std::string>& urls, const std::string& media)
+void Images::preload(const std::vector<std::string>& urls, const std::string& media, const std::string& pack_id)
 {
     preload_stop();
     {
@@ -647,6 +723,7 @@ void Images::preload(const std::vector<std::string>& urls, const std::string& me
                 pre_urls.push_back(u);
         pre_next = 0;
         pre_media = media;
+        pre_pack_id = pack_id;
     }
     pre.total = (int)pre_urls.size();
     pre.done = 0;
@@ -695,46 +772,13 @@ void Images::spawn_workers()
     }
 }
 
-bool Images::unpack(const std::string& zip)
-{
-    unzFile z = unzOpen64(zip.c_str());
-    if (!z)
-        return false;
-    unz_global_info64 gi;
-    if (unzGetGlobalInfo64(z, &gi) == UNZ_OK)
-        pre.unpack_total = (int)gi.number_entry;
-    std::vector<uint8_t> buf;
-    int r = unzGoToFirstFile(z);
-    while (r == UNZ_OK && !pre.cancel && !quit) {
-        char name[512];
-        unz_file_info64 info;
-        if (unzGetCurrentFileInfo64(z, &info, name, sizeof(name), nullptr, 0, nullptr, 0) == UNZ_OK) {
-            std::string n = name;
-            if (!n.empty() && n.back() != '/' && info.uncompressed_size > 0 && info.uncompressed_size < 16u * 1024 * 1024) {
-                std::string path = disk_path(pre_media + n);
-                if (!fs::exists(path) && unzOpenCurrentFile(z) == UNZ_OK) {
-                    buf.resize((size_t)info.uncompressed_size);
-                    int got = unzReadCurrentFile(z, buf.data(), (unsigned)buf.size());
-                    unzCloseCurrentFile(z);
-                    if (got == (int)buf.size()) {
-                        std::string tmp = path + ".unz";
-                        if (fs::write(tmp, buf.data(), buf.size()) && sceIoRename(tmp.c_str(), path.c_str()) < 0)
-                            sceIoRemove(tmp.c_str());
-                    }
-                }
-            }
-        }
-        pre.unpacked++;
-        r = unzGoToNextFile(z);
-    }
-    unzClose(z);
-    return true;
-}
-
 int Images::preload_main(unsigned int, void* arg)
 {
     Images* self = *(Images**)arg;
     Preload& p = self->pre;
+    std::string have_id;
+    fs::read(APP_DIR + "/media_pack.id", have_id);
+    bool stale = !self->pre_pack_id.empty() && trim(have_id) != self->pre_pack_id;
     int missing = 0;
     {
         std::vector<std::string> urls;
@@ -745,28 +789,32 @@ int Images::preload_main(unsigned int, void* arg)
         for (auto& u : urls) {
             if (p.cancel)
                 break;
-            if (!fs::exists(disk_path(u)))
+            if (!mpack_has(u) && !fs::exists(disk_path(u)))
                 missing++;
         }
     }
-    if (missing > 40 && !self->pre_media.empty() && !p.cancel && !self->quit) {
+    if ((stale || missing > 40) && !self->pre_media.empty() && !p.cancel && !self->quit) {
         p.stage = 1;
-        std::string zip = APP_DIR + "/dl/media_pack.zip";
+        std::string tmp = APP_DIR + "/dl/media_pack_" + (self->pre_pack_id.empty() ? std::string("x") : self->pre_pack_id) + ".zip";
         fs::mkdirs(APP_DIR + "/dl");
         net::Session session;
         session.buffer = 256 * 1024;
         std::string err;
-        bool ok = net::fetch(self->pre_media + "pack.zip", zip, &p.live[0], err, &session);
+        bool ok = net::fetch(self->pre_media + "pack.zip", tmp, &p.live[0], err, &session);
         if (!ok && !p.cancel)
             log_line("media pack: %s", err.c_str());
         p.live[0].done = 0;
         p.live[0].total = 0;
         if (ok && !p.cancel) {
             p.stage = 2;
-            self->unpack(zip);
+            mpack_close();
+            sceIoRemove(MPACK.c_str());
+            if (sceIoRename(tmp.c_str(), MPACK.c_str()) >= 0 && mpack_open(&p.unpacked, &p.unpack_total) > 0)
+                fs::write(APP_DIR + "/media_pack.id", self->pre_pack_id);
+            else
+                mpack_open(nullptr, nullptr);
         }
-        sceIoRemove(zip.c_str());
-        sceIoRemove((zip + ".part").c_str());
+        sceIoRemove(tmp.c_str());
     }
     p.stage = 3;
     if (!p.cancel && !self->quit)
@@ -815,7 +863,7 @@ int Images::preload_worker(unsigned int, void* arg)
             url = self->pre_urls[self->pre_next++];
         }
         std::string path = disk_path(url);
-        if (fs::exists(path)) {
+        if (mpack_has(url) || fs::exists(path)) {
             p.done++;
             continue;
         }
