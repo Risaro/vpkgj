@@ -38,6 +38,7 @@
 #define VPKGJ_VERSION "1.1"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
+#define VPKGJ_FOR "phc.lokilab.ru"
 #define APP_REPO "Risaro/vpkgj"
 
 int _newlib_heap_size_user = 160 * 1024 * 1024;
@@ -59,7 +60,7 @@ static const int TAB_UPDATES = CAT_COUNT;
 static const int TAB_DOWNLOADS = CAT_COUNT + 1;
 static const int TAB_COUNT = CAT_COUNT + 2;
 
-enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS, SCR_BACKUPS };
+enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS, SCR_BACKUPS, SCR_PRELOAD };
 enum ImePurpose { IME_NONE, IME_SEARCH, IME_REPO, IME_BRANCH };
 
 struct Hit {
@@ -179,6 +180,13 @@ struct App {
         return fs::read(APP_DIR + "/app_skip.txt", s) && trim(s) == v;
     }
     void draw_about(float y);
+    void start_preload();
+    void draw_preload();
+    void input_preload();
+    uint64_t pre_t = 0;
+    uint64_t pre_b = 0;
+    double pre_speed = 0;
+    bool pre_checked = false;
     uint64_t free_bytes = 0, free_at = 0;
     uint64_t free_cached()
     {
@@ -746,6 +754,8 @@ void App::draw_updates()
             draw_badge(W - 46, y + 26, "Обновление", col::ACCENT, col::TEXT);
         int idx = i;
         hits.push_back({28, y, (float)(W - 56), 72, [this, idx]() {
+                            if (idx >= (int)upd.size())
+                                return;
                             if (upd_sel == idx) {
                                 if (upd_alt[idx])
                                     ask_alt(upd[idx]);
@@ -870,6 +880,8 @@ const Entry* App::selected()
 {
     if (tab >= CAT_COUNT || filtered[tab].empty())
         return nullptr;
+    if (sel[tab] < 0 || sel[tab] >= (int)filtered[tab].size())
+        sel[tab] = 0;
     return &catalog.items[tab][filtered[tab][sel[tab]]];
 }
 
@@ -934,7 +946,7 @@ void App::start_refresh(bool manual)
         return;
     manual_refresh = manual;
     refreshing = 1;
-    SceUID th = sceKernelCreateThread("vpkgj_refresh", refresh_thread, 180, 128 * 1024, 0, 0, nullptr);
+    SceUID th = sceKernelCreateThread("vpkgj_refresh", refresh_thread, 180, 512 * 1024, 0, 0, nullptr);
     App* self = this;
     sceKernelStartThread(th, sizeof(self), &self);
 }
@@ -952,6 +964,11 @@ void App::apply_refresh()
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
         notify_updates();
+        if (!pre_checked && loaded_once) {
+            pre_checked = true;
+            if (!fs::exists(APP_DIR + "/preload.txt"))
+                start_preload();
+        }
         if (!app_prompted)
             ask_app_update(false);
         if (!refresh_err.empty()) {
@@ -1328,14 +1345,22 @@ void App::input()
     if (modal.on) {
         if (pressed & ok_btn) {
             modal.on = false;
-            if (modal.action)
-                modal.action();
+            if (modal.action) {
+                auto fn = modal.action;
+                fn();
+                }
         } else if ((pressed & SCE_CTRL_TRIANGLE) && modal.alt_action) {
             modal.on = false;
-            modal.alt_action();
+            auto fn = modal.alt_action;
+            fn();
         } else if (pressed & back_btn) {
             modal.on = false;
         }
+        return;
+    }
+
+    if (screen == SCR_PRELOAD) {
+        input_preload();
         return;
     }
 
@@ -1654,6 +1679,8 @@ void App::draw_card(const Entry& e, float x, float y)
         draw_badge(bx, y + 8, "Обновление", col::ORANGE, col::BG);
     } else if (st == ST_INSTALLED) {
         draw_badge(bx, y + 8, "Установлено", col::GREEN, col::BG);
+    } else if (e.cat == CAT_TRANSLATIONS && fs_app(e.id)) {
+        draw_badge(bx, y + 8, "Игра есть", col::ACCENT2, col::BG);
     }
     float lx = x + 8;
     if (!e.lang.empty()) {
@@ -2637,6 +2664,7 @@ void App::draw_settings()
          }},
         {"Фоновая служба", daemon_enabled() ? "включена" : "выключена", daemon_enabled() ? col::GREEN : col::MUTED, [this]() { toggle_daemon(); }},
         {"Резервные копии", "config.txt, rePatch, сейвы", col::MUTED, [this]() { open_backups(); }},
+        {"Скачать все обложки", "прокрутка без подгрузки", col::MUTED, [this]() { start_preload(); }},
         {"Очистить кеш картинок", "", col::MUTED, [this]() {
              images.clear_disk();
              show_toast("Кеш картинок очищен");
@@ -2676,6 +2704,90 @@ void App::draw_settings()
     draw_about(68);
 }
 
+void App::start_preload()
+{
+    std::vector<std::string> urls;
+    for (int c = 0; c < CAT_COUNT; c++)
+        for (auto& e : catalog.items[c]) {
+            if (!e.icon.empty())
+                urls.push_back(catalog.media_url(e.icon));
+            if (!e.shots.empty())
+                urls.push_back(catalog.media_url(e.shots[0]));
+        }
+    images.preload(urls);
+    pre_t = now_ms();
+    pre_b = 0;
+    pre_speed = 0;
+    if (images.pre.total == 0) {
+        fs::write(APP_DIR + "/preload.txt", "1");
+        return;
+    }
+    screen = SCR_PRELOAD;
+}
+
+void App::input_preload()
+{
+    Preload& p = images.pre;
+    bool finished = p.running == 0;
+    if (finished || (pressed & (back_btn | ok_btn | SCE_CTRL_START))) {
+        if (!finished)
+            images.preload_stop();
+        fs::write(APP_DIR + "/preload.txt", "1");
+        screen = SCR_BROWSE;
+        if (finished)
+            show_toast(p.failed ? "Готово, не скачалось: " + std::to_string(p.failed.load()) : "Все обложки скачаны");
+        else
+            show_toast("Остальное догрузится при прокрутке");
+    }
+}
+
+void App::draw_preload()
+{
+    Preload& p = images.pre;
+    uint64_t live = 0;
+    for (auto& l : p.live)
+        live += l.done;
+    uint64_t bytes = p.bytes + live;
+    uint64_t now = now_ms();
+    if (now - pre_t >= 1000) {
+        double sp = (double)(bytes > pre_b ? bytes - pre_b : 0) * 1000.0 / (double)(now - pre_t);
+        pre_speed = pre_speed == 0 ? sp : pre_speed * 0.6 + sp * 0.4;
+        pre_t = now;
+        pre_b = bytes;
+    }
+    int total = std::max(1, p.total.load()), done = std::min(p.done.load(), total);
+    float frac = (float)done / total;
+    gfx::mascot(W / 2 - 75, 36, 150, 1);
+    gfx::text_center(gfx::bold, W / 2, 222, 26, col::TEXT, "Готовлю VPKGJ");
+    gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Качаю обложки и скриншоты один раз, дальше всё листается мгновенно");
+    float bx = 180, bw = W - 360, by = 284;
+    gfx::rrect(bx, by, bw, 18, 9, col::SURFACE2);
+    if (frac > 0)
+        gfx::rrect(bx, by, std::max(18.0f, bw * frac), 18, 9, col::ACCENT);
+    gfx::text(gfx::bold, bx, by + 46, 18, col::TEXT, std::to_string((int)(frac * 100)) + "%");
+    gfx::text_right(gfx::regular, bx + bw, by + 46, 15, col::MUTED, std::to_string(done) + " из " + std::to_string(p.total.load()));
+    std::string info = fmt_size(bytes) + " · " + fmt_size((uint64_t)pre_speed) + "/с";
+    if (pre_speed > 1024 && done < total) {
+        uint64_t avg = done > 0 && bytes > 0 ? bytes / std::max(1, done) : 40 * 1024;
+        int left = (int)((double)(total - done) * avg / pre_speed);
+        info += " · осталось ~" + (left >= 60 ? std::to_string(left / 60) + " мин" : std::to_string(left) + " с");
+    }
+    if (p.failed)
+        info += " · ошибок " + std::to_string(p.failed.load());
+    gfx::text_center(gfx::regular, W / 2, by + 46, 15, col::ACCENT2, info);
+    gfx::text_center(gfx::regular, W / 2, 400, 13, col::MUTED, "Сделано специально для");
+    gfx::text_center(gfx::bold, W / 2, 422, 17, col::ACCENT2, VPKGJ_FOR);
+    gfx::text_center(gfx::regular, W / 2, 450, 13, col::MUTED, "by " VPKGJ_AUTHOR " · " VPKGJ_TG);
+    gfx::button(back_icon, W / 2 - 80, 488, 22);
+    gfx::text(gfx::regular, W / 2 - 50, 505, 15, col::TEXT, "Пропустить");
+    hits.push_back({(float)(W / 2 - 90), 480.0f, 180.0f, 40.0f, [this]() {
+                        images.preload_stop();
+                        fs::write(APP_DIR + "/preload.txt", "1");
+                        screen = SCR_BROWSE;
+                        show_toast("Остальное догрузится при прокрутке");
+                    }});
+}
+
 void App::draw_about(float y)
 {
     float x = 646, w = W - 28 - x, h = FOOTER_Y - 12 - y;
@@ -2692,6 +2804,9 @@ void App::draw_about(float y)
     gfx::text(gfx::bold, x + 30, ty + 42, 16, col::TEXT, VPKGJ_AUTHOR);
     gfx::text_right(gfx::bold, x + w - 30, ty + 42, 14, col::ACCENT, VPKGJ_TG);
     ty += 66;
+    gfx::text_center(gfx::regular, x + w / 2, ty + 12, 13, col::MUTED, "Сделано специально для");
+    gfx::text_center(gfx::bold, x + w / 2, ty + 32, 16, col::ACCENT2, VPKGJ_FOR);
+    ty += 46;
     std::string pc = pkgj_config_path();
     std::vector<std::string> about = {
         "Свободно на ux0: " + fmt_size(free_cached()),
@@ -2807,8 +2922,10 @@ void App::draw_modal()
     gfx::text(gfx::bold, x + w - 28 - bw + 42, by + 23, 15, col::TEXT, modal.yes);
     hits.push_back({x + w - 28 - bw, by, bw, 36, [this]() {
                         modal.on = false;
-                        if (modal.action)
-                            modal.action();
+                        if (modal.action) {
+                            auto fn = modal.action;
+                            fn();
+                            }
                     }});
     float right = x + w - 28 - bw - 12;
     if (!modal.alt.empty()) {
@@ -2819,8 +2936,10 @@ void App::draw_modal()
         gfx::text(gfx::regular, ax + 42, by + 23, 15, col::TEXT, modal.alt);
         hits.push_back({ax, by, aw, 36, [this]() {
                             modal.on = false;
-                            if (modal.alt_action)
-                                modal.alt_action();
+                            if (modal.alt_action) {
+                                auto fn = modal.alt_action;
+                                fn();
+                                }
                         }});
         right = ax - 12;
     }
@@ -2849,6 +2968,15 @@ void App::draw()
 {
     hits.clear();
     gfx::background();
+    if (screen == SCR_PRELOAD) {
+        draw_preload();
+        if (modal.on) {
+            hits.clear();
+            draw_modal();
+        }
+        draw_toast();
+        return;
+    }
     if (screen == SCR_BROWSE) {
         if (tab == TAB_DOWNLOADS)
             draw_downloads();

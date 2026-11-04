@@ -458,7 +458,34 @@ void Installed::scan()
     for (auto& id : fs::list("ux0:addcont"))
         for (auto& sub : fs::list("ux0:addcont/" + id))
             present.insert("dlc:ux0:addcont/" + id + "/" + sub);
+    for (auto& id : fs::list("ux0:rePatch"))
+        present.insert("rp:" + id);
+    found.clear();
     scanned = true;
+}
+
+bool Installed::detect(const Entry& e)
+{
+    if (!scanned)
+        scan();
+    std::string k = key(e);
+    auto it = found.find(k);
+    if (it != found.end())
+        return it->second;
+    bool r = false;
+    if (e.cat == CAT_PLUGINS) {
+        r = plugin_present(e);
+    } else if (e.cat == CAT_TRANSLATIONS) {
+        std::string type = lower(e.install);
+        if (type == "data")
+            r = !e.data_path.empty() && fs::exists(e.data_path);
+        else if (type == "plugin")
+            r = plugin_present(e);
+        else if (type != "vpk")
+            r = present.count("rp:" + e.id) > 0;
+    }
+    found[k] = r;
+    return r;
 }
 
 bool Installed::app_exists(const std::string& titleid)
@@ -487,7 +514,7 @@ Status Installed::status(const Entry& e)
         return ST_INSTALLED;
     }
     if (!recorded)
-        return ST_NONE;
+        return detect(e) ? ST_INSTALLED : ST_NONE;
     if (it->second != (e.version.empty() ? "-" : e.version) && it->second != e.alt_version)
         return ST_UPDATE;
     return ST_INSTALLED;

@@ -90,12 +90,15 @@ private:
     std::mutex m;
     std::map<std::string, std::string> versions;
     std::set<std::string> present;
+    std::map<std::string, bool> found;
     bool scanned = false;
+    bool detect(const Entry& e);
     void scan();
     void save();
     bool app_exists(const std::string& titleid);
 };
 
+bool plugin_present(const Entry& plugin);
 std::string pkgj_config_path();
 bool pkgj_urls(std::string& games, std::string& dlcs);
 void pkgj_fetch(bool force);

@@ -27,6 +27,16 @@ struct Image {
     net::Progress* progress = nullptr;
 };
 
+struct Preload {
+    std::atomic<int> total{0};
+    std::atomic<int> done{0};
+    std::atomic<int> failed{0};
+    std::atomic<uint64_t> bytes{0};
+    std::atomic<int> running{0};
+    std::atomic<bool> cancel{false};
+    net::Progress live[3];
+};
+
 class Images {
 public:
     void start();
@@ -37,6 +47,10 @@ public:
     void tick();
     void clear_disk();
     void set_busy(bool b) { busy = b; }
+    void preload(const std::vector<std::string>& urls);
+    void preload_stop();
+    bool cached(const std::string& url);
+    Preload pre;
 
 private:
     std::mutex m;
@@ -52,6 +66,11 @@ private:
     std::atomic<bool> busy{false};
     static int decode_worker(unsigned int, void* arg);
     static int net_worker(unsigned int, void* arg);
+    static int preload_worker(unsigned int, void* arg);
+    std::mutex pre_m;
+    std::vector<std::string> pre_urls;
+    size_t pre_next = 0;
+    std::vector<int> pre_threads;
     Image* request(const std::string& url, int size, bool visible);
     bool pick(int from, int to, std::string& key, Image& out);
     void finish(const std::string& key, vita2d_texture* tex);

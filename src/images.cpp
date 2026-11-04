@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <csetjmp>
 #include <cstring>
+#include <set>
 #include <vector>
 
 enum { IMG_PENDING, IMG_DECODING, IMG_NET, IMG_FETCHING, IMG_READY, IMG_FAILED };
@@ -162,6 +163,10 @@ static vita2d_texture* decode_png(const uint8_t* data, size_t size, Box box)
     png_set_filler(p, 0xFF, PNG_FILLER_AFTER);
     png_set_interlace_handling(p);
     png_read_update_info(p, info);
+    if (png_get_rowbytes(p, info) != (size_t)w * 4 || png_get_channels(p, info) != 4) {
+        png_destroy_read_struct(&p, &info, nullptr);
+        return nullptr;
+    }
     pixels.resize((size_t)w * h * 4);
     rows.resize(h);
     for (png_uint_32 y = 0; y < h; y++)
@@ -219,10 +224,6 @@ static vita2d_texture* decode(const uint8_t* b, size_t n, Box box)
         return decode_jpeg(b, n, box);
     if (b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G')
         return decode_png(b, n, box);
-    if (b[0] == 'B' && b[1] == 'M') {
-        std::lock_guard<std::mutex> g(gpu_lock);
-        return vita2d_load_BMP_buffer(b);
-    }
     return nullptr;
 }
 
@@ -323,6 +324,7 @@ void Images::start()
 void Images::stop()
 {
     quit = true;
+    preload_stop();
     {
         std::lock_guard<std::mutex> lock(m);
         for (auto& kv : cache)
@@ -411,13 +413,22 @@ bool Images::pick(int from, int to, std::string& key, Image& out)
     std::lock_guard<std::mutex> lock(m);
     Image* best = nullptr;
     const std::string* best_key = nullptr;
+    std::vector<const std::string*> busy_urls;
+    if (from == IMG_NET)
+        for (auto& kv : cache)
+            if (kv.second.state == IMG_FETCHING)
+                busy_urls.push_back(&kv.second.url);
     for (auto it = cache.begin(); it != cache.end();) {
         Image& img = it->second;
         if ((img.state == IMG_PENDING || img.state == IMG_NET) && img.used + 20 < frame) {
             it = cache.erase(it);
             continue;
         }
-        if (img.state == from) {
+        bool taken = false;
+        for (auto u : busy_urls)
+            if (*u == img.url)
+                taken = true;
+        if (img.state == from && !taken) {
             bool better = !best;
             if (best) {
                 bool v1 = img.seen + 2 >= frame, v2 = best->seen + 2 >= frame;
@@ -617,6 +628,114 @@ void Images::tick()
         for (auto t : victims)
             vita2d_free_texture(t);
     }
+}
+
+bool Images::cached(const std::string& url)
+{
+    return !remote(url) || fs::exists(disk_path(url));
+}
+
+void Images::preload(const std::vector<std::string>& urls)
+{
+    preload_stop();
+    {
+        std::lock_guard<std::mutex> lock(pre_m);
+        pre_urls.clear();
+        std::set<std::string> seen;
+        for (auto& u : urls)
+            if (remote(u) && seen.insert(u).second)
+                pre_urls.push_back(u);
+        pre_next = 0;
+    }
+    pre.total = (int)pre_urls.size();
+    pre.done = 0;
+    pre.failed = 0;
+    pre.bytes = 0;
+    pre.cancel = false;
+    for (auto& l : pre.live) {
+        l.done = 0;
+        l.total = 0;
+        l.cancel = false;
+    }
+    if (pre_urls.empty())
+        return;
+    fs::mkdirs(CACHE);
+    for (int i = 0; i < 3; i++) {
+        struct Arg {
+            Images* self;
+            int index;
+        } arg{this, i};
+        SceUID th = sceKernelCreateThread("vpkgj_preload", preload_worker, 186, 256 * 1024, 0, i == 1 ? SCE_KERNEL_CPU_MASK_USER_2 : SCE_KERNEL_CPU_MASK_USER_1, nullptr);
+        if (th >= 0) {
+            pre.running++;
+            sceKernelStartThread(th, sizeof(arg), &arg);
+            pre_threads.push_back(th);
+        }
+    }
+}
+
+void Images::preload_stop()
+{
+    pre.cancel = true;
+    for (auto& l : pre.live)
+        l.cancel = true;
+    for (auto th : pre_threads) {
+        SceUInt timeout = 5 * 1000 * 1000;
+        sceKernelWaitThreadEnd(th, nullptr, &timeout);
+    }
+    pre_threads.clear();
+}
+
+int Images::preload_worker(unsigned int, void* arg)
+{
+    struct Arg {
+        Images* self;
+        int index;
+    } a = *(Arg*)arg;
+    Images* self = a.self;
+    Preload& p = self->pre;
+    net::Progress& live = p.live[a.index];
+    net::Session session;
+    session.buffer = 64 * 1024;
+    while (!p.cancel && !self->quit) {
+        std::string url;
+        {
+            std::lock_guard<std::mutex> lock(self->pre_m);
+            if (self->pre_next >= self->pre_urls.size())
+                break;
+            url = self->pre_urls[self->pre_next++];
+        }
+        std::string path = disk_path(url);
+        if (fs::exists(path)) {
+            p.done++;
+            continue;
+        }
+        std::string tmp = path + ".pre" + std::to_string(a.index);
+        std::string err;
+        live.done = 0;
+        live.total = 0;
+        bool ok = net::fetch(url, tmp, &live, err, &session);
+        if (p.cancel) {
+            sceIoRemove(tmp.c_str());
+            sceIoRemove((tmp + ".part").c_str());
+            break;
+        }
+        if (ok) {
+            int64_t n = fs::size(tmp);
+            if (fs::exists(path) || sceIoRename(tmp.c_str(), path.c_str()) < 0)
+                sceIoRemove(tmp.c_str());
+            p.bytes += n > 0 ? (uint64_t)n : 0;
+        } else {
+            sceIoRemove((tmp + ".part").c_str());
+            p.failed++;
+        }
+        live.done = 0;
+        live.total = 0;
+        p.done++;
+    }
+    live.done = 0;
+    p.running--;
+    return sceKernelExitDeleteThread(0);
 }
 
 void Images::clear_disk()

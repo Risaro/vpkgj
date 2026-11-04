@@ -78,7 +78,6 @@ void init()
     curl_share_setopt(share, CURLSHOPT_LOCKFUNC, share_lock);
     curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, share_unlock);
     curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-    curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
 }
 
 void set_speed_limit(uint64_t bps)
