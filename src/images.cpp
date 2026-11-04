@@ -18,7 +18,7 @@
 
 enum { IMG_PENDING, IMG_DECODING, IMG_NET, IMG_FETCHING, IMG_READY, IMG_FAILED };
 
-static std::mutex gpu_lock;
+static Mutex gpu_lock;
 
 static const size_t BUDGET = 40u * 1024 * 1024;
 static const int NET_THREADS = 2;
@@ -51,13 +51,13 @@ static std::string disk_path(const std::string& url)
 
 static vita2d_texture* new_texture(int w, int h)
 {
-    std::lock_guard<std::mutex> g(gpu_lock);
+    std::lock_guard<Mutex> g(gpu_lock);
     return vita2d_create_empty_texture(w, h);
 }
 
 static void free_texture(vita2d_texture* t)
 {
-    std::lock_guard<std::mutex> g(gpu_lock);
+    std::lock_guard<Mutex> g(gpu_lock);
     vita2d_free_texture(t);
 }
 
@@ -227,14 +227,14 @@ static vita2d_texture* decode(const uint8_t* b, size_t n, Box box)
     return nullptr;
 }
 
-static std::mutex pak_lock;
+static Mutex pak_lock;
 static unzFile pak = nullptr;
 static bool pak_tried = false;
 static std::unordered_map<std::string, unz64_file_pos> pak_index;
 
 void images_close_pak()
 {
-    std::lock_guard<std::mutex> lock(pak_lock);
+    std::lock_guard<Mutex> lock(pak_lock);
     if (pak)
         unzClose(pak);
     pak = nullptr;
@@ -244,7 +244,7 @@ void images_close_pak()
 
 static bool read_pak(const std::string& name, std::vector<uint8_t>& buf)
 {
-    std::lock_guard<std::mutex> lock(pak_lock);
+    std::lock_guard<Mutex> lock(pak_lock);
     if (!pak_tried) {
         pak_tried = true;
         pak = unzOpen64("app0:covers.pak");
@@ -326,7 +326,7 @@ void Images::stop()
     quit = true;
     preload_stop();
     {
-        std::lock_guard<std::mutex> lock(m);
+        std::lock_guard<Mutex> lock(m);
         for (auto& kv : cache)
             if (kv.second.progress)
                 kv.second.progress->cancel = true;
@@ -377,7 +377,7 @@ vita2d_texture* Images::get(const std::string& url, float* alpha, int size)
         *alpha = 0;
     if (url.empty())
         return nullptr;
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     Image* img = request(url, size, true);
     if (!img || img->state != IMG_READY)
         return nullptr;
@@ -392,7 +392,7 @@ vita2d_texture* Images::peek(const std::string& url, int size)
 {
     if (url.empty())
         return nullptr;
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     auto it = cache.find(key_of(url, size));
     if (it == cache.end() || it->second.state != IMG_READY)
         return nullptr;
@@ -404,13 +404,13 @@ void Images::prefetch(const std::string& url, int size)
 {
     if (url.empty())
         return;
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     request(url, size, false);
 }
 
 bool Images::pick(int from, int to, std::string& key, Image& out)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     Image* best = nullptr;
     const std::string* best_key = nullptr;
     std::vector<const std::string*> busy_urls;
@@ -458,7 +458,7 @@ void Images::finish(const std::string& key, vita2d_texture* tex)
 {
     if (tex)
         vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     auto it = cache.find(key);
     if (it == cache.end() || it->second.state != IMG_DECODING) {
         if (tex)
@@ -477,7 +477,7 @@ void Images::finish(const std::string& key, vita2d_texture* tex)
 
 void Images::fail(const std::string& key, bool permanent)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     int n = ++fails[key];
     uint64_t wait = permanent ? 3600ull * 1000 : std::min<uint64_t>(120000, 3000ull << std::min(n, 6));
     retry_at[key] = now_ms() + wait;
@@ -507,7 +507,7 @@ int Images::decode_worker(unsigned int, void* arg)
             have = read_file(job.url, buf);
         }
         if (net) {
-            std::lock_guard<std::mutex> lock(self->m);
+            std::lock_guard<Mutex> lock(self->m);
             auto it = self->cache.find(key);
             if (it != self->cache.end())
                 it->second.state = IMG_NET;
@@ -549,7 +549,7 @@ int Images::net_worker(unsigned int, void* arg)
         }
         net::Progress progress;
         {
-            std::lock_guard<std::mutex> lock(self->m);
+            std::lock_guard<Mutex> lock(self->m);
             auto it = self->cache.find(key);
             if (it != self->cache.end())
                 it->second.progress = &progress;
@@ -558,7 +558,7 @@ int Images::net_worker(unsigned int, void* arg)
         bool ok = net::fetch(job.url, disk_path(job.url), &progress, err, &session);
         bool canceled = progress.cancel;
         {
-            std::lock_guard<std::mutex> lock(self->m);
+            std::lock_guard<Mutex> lock(self->m);
             auto it = self->cache.find(key);
             if (it != self->cache.end()) {
                 it->second.progress = nullptr;
@@ -583,7 +583,7 @@ void Images::tick()
 {
     std::vector<vita2d_texture*> victims;
     {
-        std::lock_guard<std::mutex> lock(m);
+        std::lock_guard<Mutex> lock(m);
         frame++;
         victims.swap(to_free);
         for (auto& kv : cache)
@@ -624,7 +624,7 @@ void Images::tick()
     }
     if (!victims.empty()) {
         vita2d_wait_rendering_done();
-        std::lock_guard<std::mutex> g(gpu_lock);
+        std::lock_guard<Mutex> g(gpu_lock);
         for (auto t : victims)
             vita2d_free_texture(t);
     }
@@ -639,7 +639,7 @@ void Images::preload(const std::vector<std::string>& urls)
 {
     preload_stop();
     {
-        std::lock_guard<std::mutex> lock(pre_m);
+        std::lock_guard<Mutex> lock(pre_m);
         pre_urls.clear();
         std::set<std::string> seen;
         for (auto& u : urls)
@@ -700,7 +700,7 @@ int Images::preload_worker(unsigned int, void* arg)
     while (!p.cancel && !self->quit) {
         std::string url;
         {
-            std::lock_guard<std::mutex> lock(self->pre_m);
+            std::lock_guard<Mutex> lock(self->pre_m);
             if (self->pre_next >= self->pre_urls.size())
                 break;
             url = self->pre_urls[self->pre_next++];
@@ -742,7 +742,7 @@ void Images::clear_disk()
 {
     fs::rmtree(CACHE);
     fs::mkdirs(CACHE);
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     retry_at.clear();
     fails.clear();
 }

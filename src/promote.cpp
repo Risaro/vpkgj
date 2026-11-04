@@ -1,3 +1,4 @@
+#include "mutex.hpp"
 #include "promote.hpp"
 
 #include "headbin.hpp"
@@ -13,7 +14,7 @@
 #include <cstring>
 #include <mutex>
 
-static std::mutex promoter_lock;
+static Mutex promoter_lock;
 
 void promoter_init()
 {
@@ -157,7 +158,7 @@ bool promote_app(const std::string& dir, std::string& err)
 {
     if (!make_head_bin(dir, err))
         return false;
-    std::lock_guard<std::mutex> lock(promoter_lock);
+    std::lock_guard<Mutex> lock(promoter_lock);
     int rc = scePromoterUtilityPromotePkg(dir.c_str(), 0);
     if (rc < 0) {
         char buf[64];
@@ -170,7 +171,7 @@ bool promote_app(const std::string& dir, std::string& err)
 
 bool promote_pkg(const std::string& dir, std::string& err)
 {
-    std::lock_guard<std::mutex> lock(promoter_lock);
+    std::lock_guard<Mutex> lock(promoter_lock);
     int rc = scePromoterUtilityPromotePkgWithRif(dir.c_str(), 1);
     if (rc < 0) {
         char buf[96];

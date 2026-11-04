@@ -41,8 +41,6 @@ add_executable(vpkgj
 target_include_directories(vpkgj PRIVATE $ENV{VITASDK}/arm-vita-eabi/include/jsoncpp)
 target_link_options(vpkgj PRIVATE -Wl,--wrap,fcntl -Wl,--wrap,getaddrinfo -Wl,--wrap,freeaddrinfo)
 
-target_link_options(vpkgj PRIVATE "-Wl,-u,pthread_cancel")
-
 target_link_libraries(vpkgj
   vita2d
   freetype

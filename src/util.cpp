@@ -1,3 +1,4 @@
+#include "mutex.hpp"
 #include "util.hpp"
 
 #include <psp2/io/dirent.h>
@@ -268,8 +269,8 @@ uint64_t now_ms()
 
 void log_line(const char* fmt, ...)
 {
-    static std::mutex m;
-    std::lock_guard<std::mutex> lock(m);
+    static Mutex m;
+    std::lock_guard<Mutex> lock(m);
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);

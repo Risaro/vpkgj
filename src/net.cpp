@@ -1,3 +1,4 @@
+#include "mutex.hpp"
 #include "net.hpp"
 
 #include "util.hpp"
@@ -16,20 +17,20 @@
 #include <sys/socket.h>
 #include <vector>
 
-static std::mutex resolve_lock;
+static Mutex resolve_lock;
 
 extern "C" int __real_getaddrinfo(const char*, const char*, const struct addrinfo*, struct addrinfo**);
 extern "C" void __real_freeaddrinfo(struct addrinfo*);
 
 extern "C" int __wrap_getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** res)
 {
-    std::lock_guard<std::mutex> lock(resolve_lock);
+    std::lock_guard<Mutex> lock(resolve_lock);
     return __real_getaddrinfo(node, service, hints, res);
 }
 
 extern "C" void __wrap_freeaddrinfo(struct addrinfo* ai)
 {
-    std::lock_guard<std::mutex> lock(resolve_lock);
+    std::lock_guard<Mutex> lock(resolve_lock);
     __real_freeaddrinfo(ai);
 }
 
@@ -45,7 +46,7 @@ namespace net {
 
 static uint8_t netmem[4 * 1024 * 1024];
 static CURLSH* share = nullptr;
-static std::mutex share_locks[CURL_LOCK_DATA_LAST];
+static Mutex share_locks[CURL_LOCK_DATA_LAST];
 static std::atomic<uint64_t> speed_limit{0};
 
 static void share_lock(CURL*, curl_lock_data d, curl_lock_access, void*)

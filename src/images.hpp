@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mutex.hpp"
 #include "net.hpp"
 
 #include <vita2d.h>
@@ -53,7 +54,7 @@ public:
     Preload pre;
 
 private:
-    std::mutex m;
+    Mutex m;
     std::unordered_map<std::string, Image> cache;
     std::unordered_map<std::string, uint64_t> retry_at;
     std::unordered_map<std::string, int> fails;
@@ -67,7 +68,7 @@ private:
     static int decode_worker(unsigned int, void* arg);
     static int net_worker(unsigned int, void* arg);
     static int preload_worker(unsigned int, void* arg);
-    std::mutex pre_m;
+    Mutex pre_m;
     std::vector<std::string> pre_urls;
     size_t pre_next = 0;
     std::vector<int> pre_threads;

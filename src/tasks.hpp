@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mutex.hpp"
 #include "catalog.hpp"
 #include "net.hpp"
 
@@ -16,7 +17,7 @@ struct Task {
     std::vector<Entry> deps;
     std::atomic<int> state{TS_QUEUED};
     net::Progress progress;
-    std::mutex m;
+    Mutex m;
     std::string stage;
     std::string error;
     std::string note;
@@ -45,7 +46,7 @@ public:
     int active();
 
 private:
-    std::mutex m;
+    Mutex m;
     std::vector<std::shared_ptr<Task>> tasks;
     Installed* installed = nullptr;
     int thread = -1;

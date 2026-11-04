@@ -407,7 +407,7 @@ void Catalog::load_pkgj()
 
 void Installed::load()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     std::string s;
     if (!fs::read(APP_DIR + "/installed.txt", s))
         return;
@@ -430,7 +430,7 @@ void Installed::save()
 
 void Installed::set(const Entry& e)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     versions[key(e)] = e.version.empty() ? "-" : e.version;
     scanned = false;
     save();
@@ -438,7 +438,7 @@ void Installed::set(const Entry& e)
 
 void Installed::remove(const Entry& e)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     versions.erase(key(e));
     scanned = false;
     save();
@@ -446,7 +446,7 @@ void Installed::remove(const Entry& e)
 
 void Installed::refresh()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     scanned = false;
 }
 
@@ -497,7 +497,7 @@ bool Installed::app_exists(const std::string& titleid)
 
 Status Installed::status(const Entry& e)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     auto it = versions.find(key(e));
     bool recorded = it != versions.end();
     if (e.cat == CAT_GAMES && e.dlc) {
@@ -522,7 +522,7 @@ Status Installed::status(const Entry& e)
 
 std::string Installed::version_of(const Entry& e)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     auto it = versions.find(key(e));
     return it == versions.end() ? "" : it->second;
 }

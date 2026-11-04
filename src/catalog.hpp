@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mutex.hpp"
 #include <cstdint>
 #include <map>
 #include <set>
@@ -87,7 +88,7 @@ public:
     void refresh();
 
 private:
-    std::mutex m;
+    Mutex m;
     std::map<std::string, std::string> versions;
     std::set<std::string> present;
     std::map<std::string, bool> found;

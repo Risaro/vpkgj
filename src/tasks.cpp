@@ -18,25 +18,25 @@ static const std::string TEMP = "ux0:temp/vpkgj";
 
 std::string Task::get_stage()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     return stage;
 }
 
 std::string Task::get_note()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     return note;
 }
 
 std::string Task::get_error()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     return error;
 }
 
 void Task::set_stage(const std::string& s)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     stage = s;
 }
 
@@ -261,7 +261,7 @@ static bool install_plugin_files(Task& t, const Entry& pe, const std::string& fi
         if (!tai_add(sec, p, err))
             return false;
     }
-    std::lock_guard<std::mutex> lock(t.m);
+    std::lock_guard<Mutex> lock(t.m);
     t.note = "Перезагрузи консоль, чтобы плагин включился";
     t.reboot = true;
     return true;
@@ -311,7 +311,7 @@ static bool install_deps(Task& t, std::string& err)
         if (plugin_present(d))
             continue;
         if (d.url.empty()) {
-            std::lock_guard<std::mutex> lock(t.m);
+            std::lock_guard<Mutex> lock(t.m);
             t.note = "Не хватает " + d.name + ". " + d.description;
             continue;
         }
@@ -323,7 +323,7 @@ static bool install_deps(Task& t, std::string& err)
             err = d.name + ": " + err;
             return false;
         }
-        std::lock_guard<std::mutex> lock(t.m);
+        std::lock_guard<Mutex> lock(t.m);
         t.note = "Перезагрузи консоль, чтобы плагины включились";
         t.reboot = true;
     }
@@ -426,7 +426,7 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
         if (!tai_add(ends_with(lower(p), ".skprx") ? "*KERNEL" : "*" + e.id, p, err))
             return false;
     if (!plugins.empty()) {
-        std::lock_guard<std::mutex> lock(t.m);
+        std::lock_guard<Mutex> lock(t.m);
         t.note = "Перезагрузи консоль, чтобы плагин включился";
     t.reboot = true;
     }
@@ -446,7 +446,7 @@ static bool self_update(Task& t, const std::string& file, std::string& err)
     });
     if (!ok)
         return false;
-    std::lock_guard<std::mutex> lock(t.m);
+    std::lock_guard<Mutex> lock(t.m);
     t.restart = true;
     t.note = "Перезапусти VPKGJ, чтобы включилась новая версия";
     return true;
@@ -464,7 +464,7 @@ void Tasks::run(Task& t)
             t.set_stage("Готово");
             t.state = TS_DONE;
         } else {
-            std::lock_guard<std::mutex> lock(t.m);
+            std::lock_guard<Mutex> lock(t.m);
             t.error = t.progress.cancel ? "Отменено" : err;
             t.state = t.progress.cancel ? TS_CANCELED : TS_FAILED;
         }
@@ -553,7 +553,7 @@ void Tasks::run(Task& t)
         t.set_stage("Готово");
         t.state = TS_DONE;
     } else {
-        std::lock_guard<std::mutex> lock(t.m);
+        std::lock_guard<Mutex> lock(t.m);
         t.error = t.progress.cancel ? "Отменено" : err;
         t.state = t.progress.cancel ? TS_CANCELED : TS_FAILED;
         log_line("task %s failed: %s", e.id.c_str(), t.error.c_str());
@@ -567,7 +567,7 @@ int Tasks::worker(unsigned int, void* arg)
     while (!self->quit) {
         std::shared_ptr<Task> next;
         {
-            std::lock_guard<std::mutex> lock(self->m);
+            std::lock_guard<Mutex> lock(self->m);
             for (auto& t : self->tasks) {
                 if (t->state == TS_QUEUED) {
                     next = t;
@@ -604,7 +604,7 @@ void Tasks::stop()
 {
     quit = true;
     {
-        std::lock_guard<std::mutex> lock(m);
+        std::lock_guard<Mutex> lock(m);
         for (auto& t : tasks)
             t->progress.cancel = true;
     }
@@ -616,7 +616,7 @@ void Tasks::stop()
 
 std::shared_ptr<Task> Tasks::add(const Entry& e, const std::vector<Entry>& deps)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     for (auto& t : tasks)
         if (t->entry.cat == e.cat && t->entry.id == e.id && t->entry.region == e.region && t->entry.content == e.content &&
             (t->state == TS_QUEUED || t->state == TS_RUNNING))
@@ -631,7 +631,7 @@ std::shared_ptr<Task> Tasks::add(const Entry& e, const std::vector<Entry>& deps)
 
 std::shared_ptr<Task> Tasks::find(const Entry& e)
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     for (auto it = tasks.rbegin(); it != tasks.rend(); ++it)
         if ((*it)->entry.cat == e.cat && (*it)->entry.id == e.id && (*it)->entry.region == e.region &&
             (*it)->entry.content == e.content)
@@ -641,13 +641,13 @@ std::shared_ptr<Task> Tasks::find(const Entry& e)
 
 std::vector<std::shared_ptr<Task>> Tasks::list()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     return tasks;
 }
 
 void Tasks::clear_finished()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](const std::shared_ptr<Task>& t) {
                     return t->state == TS_DONE || t->state == TS_FAILED || t->state == TS_CANCELED;
                 }),
@@ -656,7 +656,7 @@ void Tasks::clear_finished()
 
 int Tasks::active()
 {
-    std::lock_guard<std::mutex> lock(m);
+    std::lock_guard<Mutex> lock(m);
     int n = 0;
     for (auto& t : tasks)
         if (t->state == TS_QUEUED || t->state == TS_RUNNING)

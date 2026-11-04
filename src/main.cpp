@@ -138,7 +138,7 @@ struct App {
 
     std::vector<Hit> hits;
 
-    std::mutex refresh_m;
+    Mutex refresh_m;
     std::atomic<int> refreshing{0};
     std::unique_ptr<Catalog> fresh;
     std::string refresh_err;
@@ -932,7 +932,7 @@ int App::refresh_thread(unsigned int, void* arg)
         }
     }
     {
-        std::lock_guard<std::mutex> lock(a->refresh_m);
+        std::lock_guard<Mutex> lock(a->refresh_m);
         a->fresh = std::move(c);
         a->refresh_err = ok ? "" : (err.empty() ? "Ошибка сети" : err);
     }
@@ -956,7 +956,7 @@ void App::apply_refresh()
     if (refreshing != 2)
         return;
     refreshing = 0;
-    std::lock_guard<std::mutex> lock(refresh_m);
+    std::lock_guard<Mutex> lock(refresh_m);
     if (fresh) {
         bool changed = fresh->version != catalog.version;
         catalog = std::move(*fresh);
