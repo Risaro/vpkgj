@@ -85,7 +85,7 @@ struct App {
     Tasks tasks;
     Images images;
 
-    Screen screen = SCR_BROWSE;
+    Screen screen = SCR_PRELOAD;
     int tab = CAT_PORTS;
     int sel[TAB_COUNT] = {0};
     float scroll[TAB_COUNT] = {0};
@@ -964,10 +964,14 @@ void App::apply_refresh()
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
         notify_updates();
-        if (!pre_checked && loaded_once) {
+        if (!pre_checked) {
             pre_checked = true;
-            if (!fs::exists(APP_DIR + "/preload.txt"))
+            std::string mark;
+            fs::read(APP_DIR + "/preload.txt", mark);
+            if (loaded_once && trim(mark) != catalog.media + "|" + catalog.version)
                 start_preload();
+            else
+                screen = SCR_BROWSE;
         }
         if (!app_prompted)
             ask_app_update(false);
@@ -2719,7 +2723,9 @@ void App::start_preload()
     pre_b = 0;
     pre_speed = 0;
     if (images.pre.total == 0) {
-        fs::write(APP_DIR + "/preload.txt", "1");
+        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version);
+        if (screen == SCR_PRELOAD)
+            screen = SCR_BROWSE;
         return;
     }
     screen = SCR_PRELOAD;
@@ -2728,17 +2734,12 @@ void App::start_preload()
 void App::input_preload()
 {
     Preload& p = images.pre;
-    bool finished = p.running == 0;
-    if (finished || (pressed & (back_btn | ok_btn | SCE_CTRL_START))) {
-        if (!finished)
-            images.preload_stop();
-        fs::write(APP_DIR + "/preload.txt", "1");
-        screen = SCR_BROWSE;
-        if (finished)
-            show_toast(p.failed ? "Готово, не скачалось: " + std::to_string(p.failed.load()) : "Все обложки скачаны");
-        else
-            show_toast("Остальное догрузится при прокрутке");
-    }
+    if (!pre_checked || p.running != 0)
+        return;
+    if (p.failed == 0)
+        fs::write(APP_DIR + "/preload.txt", catalog.media + "|" + catalog.version);
+    screen = SCR_BROWSE;
+    show_toast(p.failed ? "Готово, не скачалось: " + std::to_string(p.failed.load()) + ", докачаю при следующем запуске" : "Все обложки скачаны");
 }
 
 void App::draw_preload()
@@ -2754,6 +2755,16 @@ void App::draw_preload()
         pre_speed = pre_speed == 0 ? sp : pre_speed * 0.6 + sp * 0.4;
         pre_t = now;
         pre_b = bytes;
+    }
+    if (!pre_checked) {
+        gfx::mascot(W / 2 - 75, 36, 150, 1);
+        gfx::text_center(gfx::bold, W / 2, 222, 26, col::TEXT, "Готовлю VPKGJ");
+        gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Загружаю каталог...");
+        gfx::spinner(W / 2, 300, 12, col::ACCENT);
+        gfx::text_center(gfx::regular, W / 2, 400, 13, col::MUTED, "Сделано специально для");
+        gfx::text_center(gfx::bold, W / 2, 422, 17, col::ACCENT2, VPKGJ_FOR);
+        gfx::text_center(gfx::regular, W / 2, 450, 13, col::MUTED, "by " VPKGJ_AUTHOR " · " VPKGJ_TG);
+        return;
     }
     int total = std::max(1, p.total.load()), done = std::min(p.done.load(), total);
     float frac = (float)done / total;
@@ -2778,14 +2789,7 @@ void App::draw_preload()
     gfx::text_center(gfx::regular, W / 2, 400, 13, col::MUTED, "Сделано специально для");
     gfx::text_center(gfx::bold, W / 2, 422, 17, col::ACCENT2, VPKGJ_FOR);
     gfx::text_center(gfx::regular, W / 2, 450, 13, col::MUTED, "by " VPKGJ_AUTHOR " · " VPKGJ_TG);
-    gfx::button(back_icon, W / 2 - 80, 488, 22);
-    gfx::text(gfx::regular, W / 2 - 50, 505, 15, col::TEXT, "Пропустить");
-    hits.push_back({(float)(W / 2 - 90), 480.0f, 180.0f, 40.0f, [this]() {
-                        images.preload_stop();
-                        fs::write(APP_DIR + "/preload.txt", "1");
-                        screen = SCR_BROWSE;
-                        show_toast("Остальное догрузится при прокрутке");
-                    }});
+    gfx::spinner(W / 2, 500, 10, col::ACCENT);
 }
 
 void App::draw_about(float y)
