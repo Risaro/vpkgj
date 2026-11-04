@@ -15,10 +15,17 @@ struct Progress {
 
 using Sink = std::function<bool(const uint8_t* data, size_t size)>;
 
+struct Session {
+    void* handle = nullptr;
+    long buffer = 512 * 1024;
+    ~Session();
+};
+
 void init();
 void fini();
-bool get(const std::string& url, std::string& out, std::string& err);
-bool fetch(const std::string& url, const std::string& path, Progress* p, std::string& err);
+void set_speed_limit(uint64_t bytes_per_sec);
+bool get(const std::string& url, std::string& out, std::string& err, Session* s = nullptr);
+bool fetch(const std::string& url, const std::string& path, Progress* p, std::string& err, Session* s = nullptr);
 bool stream(const std::string& url, const Sink& sink, Progress* p, std::string& err);
 
 }
