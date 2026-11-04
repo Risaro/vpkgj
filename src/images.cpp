@@ -449,7 +449,7 @@ void Images::finish(const std::string& key, vita2d_texture* tex)
         vita2d_texture_set_filters(tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     std::lock_guard<std::mutex> lock(m);
     auto it = cache.find(key);
-    if (it == cache.end()) {
+    if (it == cache.end() || it->second.state != IMG_DECODING) {
         if (tex)
             to_free.push_back(tex);
         return;
