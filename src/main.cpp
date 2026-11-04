@@ -21,6 +21,9 @@
 #include <psp2/touch.h>
 
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/cpu.h>
+
+#include <json/json.h>
 
 #include <algorithm>
 #include <cmath>
@@ -29,8 +32,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <sstream>
 
-#define VPKGJ_VERSION "1.0"
+#define VPKGJ_VERSION "1.1"
+#define VPKGJ_AUTHOR "Risaro"
+#define VPKGJ_TG "t.me/lik1sa"
+#define APP_REPO "Risaro/vpkgj"
 
 int _newlib_heap_size_user = 160 * 1024 * 1024;
 unsigned int sceUserMainThreadStackSize = 1 * 1024 * 1024;
@@ -149,6 +157,37 @@ struct App {
     float tx0 = 0, ty0 = 0, tx = 0, ty = 0;
     bool dragged = false;
 
+    std::vector<std::function<void()>> settings_actions;
+    int speed_mode = 0;
+    void load_prefs();
+    void save_prefs();
+    void apply_speed();
+    std::string bg_name;
+    uint64_t bg_done = 0, bg_total = 0;
+    int bg_left = 0;
+    uint64_t bg_polled = 0;
+    void poll_bg();
+    void queue_background(const Entry& e);
+    void cancel_background();
+    void ask_daemon();
+    void ask_app_update(bool manual);
+    bool app_update_available();
+    bool app_prompted = false;
+    bool ignored_app(const std::string& v)
+    {
+        std::string s;
+        return fs::read(APP_DIR + "/app_skip.txt", s) && trim(s) == v;
+    }
+    void draw_about(float y);
+    uint64_t free_bytes = 0, free_at = 0;
+    uint64_t free_cached()
+    {
+        if (!free_at || now_ms() - free_at > 3000) {
+            free_bytes = fs::free_space("ux0:");
+            free_at = now_ms();
+        }
+        return free_bytes;
+    }
     void run();
     void input();
     void touch();
@@ -179,13 +218,22 @@ struct App {
     void input_updates(uint32_t act);
     void ask_alt(const Entry& e);
     bool ignored(const Entry& e, const std::string& version);
+    std::set<std::string> ignored_set;
+    bool ignored_loaded = false;
     void ignore(const Entry& e, const std::string& version);
-    int sort_mode = 0;
-    int region_mode = 0;
-    bool only_ru = false;
-    bool only_installed = false;
-    bool hide_dlc = false;
-    bool only_data = false;
+    struct View {
+        int sort = 0;
+        int region = 0;
+        bool flag[16] = {};
+    };
+    View views[CAT_COUNT];
+    std::string query_lower;
+    std::set<std::string> apps;
+    uint64_t apps_scanned_at = 0;
+    bool fs_app(const std::string& id);
+    void load_views();
+    void save_views();
+    void rebuild_cat(int c);
     bool filters_open = false;
     int filter_sel = 0;
     void draw_filters();
@@ -244,100 +292,251 @@ void App::show_toast(const std::string& s)
     toast_until = now_ms() + 2600;
 }
 
-static const char* SORT_NAMES[] = {"Как в каталоге", "По названию", "Сначала большие", "Сначала маленькие"};
+enum SortKind { S_CATALOG, S_NAME, S_NEW, S_BIG, S_SMALL, S_REGION, S_AUTHOR, S_GAME, S_SECTION };
+enum FilterKind { F_REGION, F_RU, F_INSTALLED, F_UPDATES, F_HIDE_DLC, F_ONLY_DLC, F_DATA, F_OWN_FILES, F_GAME_HERE, F_COUNT };
+
+static const char* SORT_NAMES[] = {"Как в каталоге", "По названию", "Сначала новые", "Сначала большие", "Сначала маленькие", "По региону", "По автору", "По игре", "По разделу"};
+static const char* FILTER_NAMES[] = {"Регион", "Есть русский язык", "Только установленные", "Только с обновлением", "Скрыть DLC", "Только DLC", "Data скачается сама", "Нужны свои файлы", "Игра есть на консоли"};
 static const char* REGION_NAMES[] = {"Все", "EU", "US", "JP", "ASIA"};
+
+static const std::vector<int>& sorts_for(int c)
+{
+    static const std::vector<int> v[CAT_COUNT] = {
+        {S_CATALOG, S_NAME, S_NEW, S_REGION, S_BIG, S_SMALL},
+        {S_CATALOG, S_NAME, S_AUTHOR, S_NEW, S_BIG, S_SMALL},
+        {S_CATALOG, S_NAME, S_GAME, S_NEW, S_BIG, S_SMALL},
+        {S_CATALOG, S_NAME, S_AUTHOR, S_NEW, S_BIG, S_SMALL},
+        {S_CATALOG, S_NAME, S_SECTION, S_AUTHOR},
+    };
+    return v[c];
+}
+
+static const std::vector<int>& filters_for(int c)
+{
+    static const std::vector<int> v[CAT_COUNT] = {
+        {F_REGION, F_RU, F_INSTALLED, F_UPDATES, F_HIDE_DLC, F_ONLY_DLC},
+        {F_DATA, F_OWN_FILES, F_RU, F_INSTALLED, F_UPDATES},
+        {F_GAME_HERE, F_INSTALLED, F_UPDATES},
+        {F_RU, F_INSTALLED, F_UPDATES},
+        {F_INSTALLED, F_UPDATES},
+    };
+    return v[c];
+}
+
+static int region_rank(const std::string& r)
+{
+    for (int i = 1; i < 5; i++)
+        if (r == REGION_NAMES[i])
+            return i;
+    return 5;
+}
+
+void App::load_views()
+{
+    std::string s;
+    if (!fs::read(APP_DIR + "/view.txt", s))
+        return;
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t e = s.find('\n', pos);
+        std::string line = s.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
+        pos = e == std::string::npos ? s.size() : e + 1;
+        int c = -1, sort = 0, region = 0;
+        unsigned flags = 0;
+        if (sscanf(line.c_str(), "%d %d %d %u", &c, &sort, &region, &flags) == 4 && c >= 0 && c < CAT_COUNT) {
+            View& v = views[c];
+            v.sort = sort >= 0 && sort < (int)sorts_for(c).size() ? sort : 0;
+            v.region = region >= 0 && region < 5 ? region : 0;
+            for (int i = 0; i < F_COUNT; i++)
+                v.flag[i] = (flags >> i) & 1;
+        }
+    }
+}
+
+void App::save_views()
+{
+    std::string s;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        unsigned flags = 0;
+        for (int i = 0; i < F_COUNT; i++)
+            if (views[c].flag[i])
+                flags |= 1u << i;
+        char line[64];
+        snprintf(line, sizeof(line), "%d %d %d %u\n", c, views[c].sort, views[c].region, flags);
+        s += line;
+    }
+    fs::write(APP_DIR + "/view.txt", s);
+}
+
+void App::rebuild_cat(int c)
+{
+    const std::string& q = query_lower;
+    const View& v = views[c];
+    auto& items = catalog.items[c];
+    auto& out = filtered[c];
+    out.clear();
+    out.reserve(items.size());
+    bool need_status = v.flag[F_INSTALLED] || v.flag[F_UPDATES];
+    for (int i = 0; i < (int)items.size(); i++) {
+        const Entry& e = items[i];
+        if (!q.empty() && e.search.find(q) == std::string::npos)
+            continue;
+        if (c == CAT_GAMES) {
+            if (v.region && e.region != REGION_NAMES[v.region])
+                continue;
+            if (v.flag[F_HIDE_DLC] && e.dlc)
+                continue;
+            if (v.flag[F_ONLY_DLC] && !e.dlc)
+                continue;
+        }
+        if (v.flag[F_RU] && !e.ru)
+            continue;
+        if (v.flag[F_DATA] && e.data.empty())
+            continue;
+        if (v.flag[F_OWN_FILES] && !(e.data.empty() && !e.data_path.empty()))
+            continue;
+        if (v.flag[F_GAME_HERE] && !fs_app(e.id))
+            continue;
+        if (need_status) {
+            Status st = status_of(e);
+            if (v.flag[F_INSTALLED] && st == ST_NONE)
+                continue;
+            if (v.flag[F_UPDATES] && st != ST_UPDATE)
+                continue;
+        }
+        out.push_back(i);
+    }
+    int kind = sorts_for(c)[v.sort];
+    if (kind != S_CATALOG) {
+        auto cmp = [&](int a, int b) {
+            const Entry& x = items[a];
+            const Entry& y = items[b];
+            switch (kind) {
+            case S_NAME:
+                return x.sort_name < y.sort_name;
+            case S_NEW:
+                if (x.date != y.date)
+                    return x.date > y.date;
+                return a > b;
+            case S_BIG:
+                return x.size > y.size;
+            case S_SMALL:
+                if ((x.size == 0) != (y.size == 0))
+                    return y.size == 0;
+                return x.size < y.size;
+            case S_REGION: {
+                int rx = region_rank(x.region), ry = region_rank(y.region);
+                if (rx != ry)
+                    return rx < ry;
+                return x.sort_name < y.sort_name;
+            }
+            case S_AUTHOR:
+                if (x.author != y.author)
+                    return lower(x.author) < lower(y.author);
+                return x.sort_name < y.sort_name;
+            case S_GAME:
+                if (x.id != y.id)
+                    return x.id < y.id;
+                return x.sort_name < y.sort_name;
+            case S_SECTION:
+                if (x.tai_section != y.tai_section)
+                    return x.tai_section < y.tai_section;
+                return x.sort_name < y.sort_name;
+            }
+            return false;
+        };
+        std::stable_sort(out.begin(), out.end(), cmp);
+    }
+    if (sel[c] >= (int)out.size())
+        sel[c] = std::max(0, (int)out.size() - 1);
+}
+
+bool App::fs_app(const std::string& id)
+{
+    if (apps_scanned_at == 0 || now_ms() - apps_scanned_at > 5000) {
+        apps.clear();
+        for (auto& a : fs::list("ux0:app"))
+            apps.insert(a);
+        apps_scanned_at = now_ms();
+    }
+    return apps.count(id) > 0;
+}
 
 void App::rebuild()
 {
-    std::string q = lower(trim(query));
-    std::map<std::string, bool> tr;
-    for (auto& t : catalog.items[CAT_TRANSLATIONS])
-        tr[t.id] = true;
-    for (int c = 0; c < CAT_COUNT; c++) {
-        filtered[c].clear();
-        auto& items = catalog.items[c];
-        for (int i = 0; i < (int)items.size(); i++) {
-            const Entry& e = items[i];
-            if (!q.empty() && e.search.find(q) == std::string::npos)
-                continue;
-            if (region_mode && c == CAT_GAMES && e.region != REGION_NAMES[region_mode])
-                continue;
-            if (hide_dlc && e.dlc)
-                continue;
-            if (only_ru && lower(e.lang).find("ru") == std::string::npos && !tr.count(e.id))
-                continue;
-            if (only_installed && status_of(e) == ST_NONE)
-                continue;
-            if (only_data && (c != CAT_PORTS || e.data.empty()))
-                continue;
-            filtered[c].push_back(i);
-        }
-        if (sort_mode) {
-            auto& f = filtered[c];
-            std::stable_sort(f.begin(), f.end(), [&](int a, int b) {
-                const Entry& x = items[a];
-                const Entry& y = items[b];
-                if (sort_mode == 1)
-                    return lower(x.name) < lower(y.name);
-                if (sort_mode == 2)
-                    return x.size > y.size;
-                return x.size < y.size;
-            });
-        }
-        if (sel[c] >= (int)filtered[c].size())
-            sel[c] = std::max(0, (int)filtered[c].size() - 1);
-    }
+    query_lower = lower(trim(query));
+    for (int c = 0; c < CAT_COUNT; c++)
+        rebuild_cat(c);
 }
 
 std::string App::filter_summary()
 {
+    if (tab >= CAT_COUNT)
+        return "";
+    const View& v = views[tab];
     std::string s;
     auto add = [&](const std::string& x) { s += (s.empty() ? "" : " · ") + x; };
-    if (sort_mode)
-        add(SORT_NAMES[sort_mode]);
-    if (region_mode)
-        add(REGION_NAMES[region_mode]);
-    if (only_ru)
-        add("Есть русский");
-    if (only_installed)
-        add("Установленные");
-    if (hide_dlc)
-        add("Без DLC");
-    if (only_data)
-        add("С готовой data");
+    if (v.sort)
+        add(SORT_NAMES[sorts_for(tab)[v.sort]]);
+    for (int f : filters_for(tab)) {
+        if (f == F_REGION) {
+            if (v.region)
+                add(REGION_NAMES[v.region]);
+        } else if (v.flag[f]) {
+            add(FILTER_NAMES[f]);
+        }
+    }
     return s;
 }
 
 void App::input_filters(uint32_t act)
 {
+    if (tab >= CAT_COUNT) {
+        filters_open = false;
+        return;
+    }
+    View& v = views[tab];
+    const auto& fl = filters_for(tab);
+    int rows = 1 + (int)fl.size();
+    if (filter_sel >= rows)
+        filter_sel = 0;
     if (act & SCE_CTRL_UP)
-        filter_sel = (filter_sel + 5) % 6;
+        filter_sel = (filter_sel + rows - 1) % rows;
     if (act & SCE_CTRL_DOWN)
-        filter_sel = (filter_sel + 1) % 6;
+        filter_sel = (filter_sel + 1) % rows;
     int d = (act & SCE_CTRL_LEFT) ? -1 : (act & (SCE_CTRL_RIGHT | ok_btn)) ? 1 : 0;
+    bool changed = false;
     if (d) {
-        if (filter_sel == 0)
-            sort_mode = (sort_mode + 4 + d) % 4;
-        else if (filter_sel == 1)
-            region_mode = (region_mode + 5 + d) % 5;
-        else if (filter_sel == 2)
-            only_ru = !only_ru;
-        else if (filter_sel == 3)
-            only_installed = !only_installed;
-        else if (filter_sel == 4)
-            hide_dlc = !hide_dlc;
-        else
-            only_data = !only_data;
-        rebuild();
-        if (tab < CAT_COUNT) {
-            sel[tab] = 0;
-            scroll_target[tab] = 0;
+        if (filter_sel == 0) {
+            int n = (int)sorts_for(tab).size();
+            v.sort = (v.sort + n + d) % n;
+        } else {
+            int f = fl[filter_sel - 1];
+            if (f == F_REGION) {
+                v.region = (v.region + 5 + d) % 5;
+            } else {
+                v.flag[f] = !v.flag[f];
+                if (f == F_HIDE_DLC && v.flag[f])
+                    v.flag[F_ONLY_DLC] = false;
+                if (f == F_ONLY_DLC && v.flag[f])
+                    v.flag[F_HIDE_DLC] = false;
+                if (f == F_DATA && v.flag[f])
+                    v.flag[F_OWN_FILES] = false;
+                if (f == F_OWN_FILES && v.flag[f])
+                    v.flag[F_DATA] = false;
+            }
         }
+        changed = true;
     }
     if (pressed & SCE_CTRL_TRIANGLE) {
-        sort_mode = region_mode = 0;
-        only_ru = only_installed = hide_dlc = only_data = false;
-        rebuild();
+        v = View();
+        changed = true;
+    }
+    if (changed) {
+        rebuild_cat(tab);
+        sel[tab] = 0;
+        scroll_target[tab] = 0;
+        save_views();
     }
     if (pressed & (back_btn | SCE_CTRL_SELECT))
         filters_open = false;
@@ -345,29 +544,42 @@ void App::input_filters(uint32_t act)
 
 void App::draw_filters()
 {
-    gfx::rect(0, 0, W, H, gfx::alpha(RGBA8(0, 0, 0, 255), 0.55f));
-    float w = 520, h = 378, x = (W - w) / 2, y = (H - h) / 2 - 10;
-    gfx::rrect(x, y, w, h, 20, col::SURFACE);
+    const View& v = views[tab];
+    const auto& fl = filters_for(tab);
+    int rows = 1 + (int)fl.size();
+    gfx::rect(0, 0, W, H, gfx::alpha(RGBA8(0, 0, 0, 255), 0.6f));
+    float w = 540, h = 96 + rows * 46, x = (W - w) / 2, y = (H - h) / 2 - 10;
+    gfx::rrect(x, y, w, h, 22, col::SURFACE);
+    gfx::rframe(x, y, w, h, 22, 1, col::LINE);
     gfx::text(gfx::bold, x + 28, y + 42, 20, col::TEXT, "Сортировка и фильтры");
-    struct Row {
-        std::string title, value;
-    } rows[] = {
-        {"Сортировка", SORT_NAMES[sort_mode]},
-        {"Регион игр", REGION_NAMES[region_mode]},
-        {"Только с русским языком", only_ru ? "да" : "нет"},
-        {"Только установленные", only_installed ? "да" : "нет"},
-        {"Скрыть DLC", hide_dlc ? "да" : "нет"},
-        {"Порты с готовой data", only_data ? "да" : "нет"},
-    };
-    for (int i = 0; i < 6; i++) {
-        float ry = y + 64 + i * 48;
+    gfx::text_right(gfx::regular, x + w - 28, y + 41, 14, col::ACCENT, category_title((Category)tab));
+    for (int i = 0; i < rows; i++) {
+        float ry = y + 64 + i * 46;
         bool on = i == filter_sel;
-        gfx::rrect(x + 16, ry, w - 32, 40, 10, on ? col::SURFACE2 : gfx::alpha(col::SURFACE2, 0.4f));
+        std::string title, value;
+        bool active = false;
+        if (i == 0) {
+            title = "Сортировка";
+            value = SORT_NAMES[sorts_for(tab)[v.sort]];
+            active = v.sort != 0;
+        } else {
+            int f = fl[i - 1];
+            title = FILTER_NAMES[f];
+            if (f == F_REGION) {
+                value = REGION_NAMES[v.region];
+                active = v.region != 0;
+            } else {
+                value = v.flag[f] ? "да" : "нет";
+                active = v.flag[f];
+            }
+        }
+        gfx::rrect(x + 16, ry, w - 32, 40, 12, on ? col::SURFACE2 : gfx::alpha(col::SURFACE2, 0.35f));
         if (on)
-            gfx::rframe(x + 16, ry, w - 32, 40, 10, 2, col::ACCENT);
-        gfx::text(gfx::regular, x + 32, ry + 26, 15, col::TEXT, rows[i].title);
-        std::string v = "‹ " + rows[i].value + " ›";
-        gfx::text_right(gfx::bold, x + w - 32, ry + 26, 15, on ? col::ACCENT : col::MUTED, v);
+            gfx::rframe(x + 16, ry, w - 32, 40, 12, 2, col::ACCENT);
+        if (active)
+            gfx::circle(x + 32, ry + 20, 4, col::ACCENT);
+        gfx::text(gfx::regular, x + 44, ry + 26, 15, col::TEXT, title);
+        gfx::text_right(gfx::bold, x + w - 32, ry + 26, 15, on || active ? col::ACCENT : col::MUTED, "‹ " + value + " ›");
         int idx = i;
         hits.push_back({x + 16, ry, w - 32, 40, [this, idx]() {
                             filter_sel = idx;
@@ -378,16 +590,32 @@ void App::draw_filters()
 
 bool App::ignored(const Entry& e, const std::string& version)
 {
-    std::string s;
-    fs::read(APP_DIR + "/ignored.txt", s);
-    return s.find(std::string(category_key(e.cat)) + "/" + e.id + "/" + version + "\n") != std::string::npos;
+    if (!ignored_loaded) {
+        ignored_loaded = true;
+        std::string s;
+        fs::read(APP_DIR + "/ignored.txt", s);
+        size_t pos = 0;
+        while (pos < s.size()) {
+            size_t n = s.find('\n', pos);
+            if (n == std::string::npos)
+                n = s.size();
+            if (n > pos)
+                ignored_set.insert(s.substr(pos, n - pos));
+            pos = n + 1;
+        }
+    }
+    return ignored_set.count(std::string(category_key(e.cat)) + "/" + e.id + "/" + version) > 0;
 }
 
 void App::ignore(const Entry& e, const std::string& version)
 {
+    std::string k = std::string(category_key(e.cat)) + "/" + e.id + "/" + version;
+    ignored(e, version);
+    ignored_set.insert(k);
     std::string s;
-    fs::read(APP_DIR + "/ignored.txt", s);
-    fs::write(APP_DIR + "/ignored.txt", s + category_key(e.cat) + "/" + e.id + "/" + version + "\n");
+    for (auto& x : ignored_set)
+        s += x + "\n";
+    fs::write(APP_DIR + "/ignored.txt", s);
 }
 
 std::vector<Entry> App::collect_alt()
@@ -482,8 +710,9 @@ void App::input_updates(uint32_t act)
 void App::draw_updates()
 {
     if (upd.empty()) {
-        gfx::text_center(gfx::bold, W / 2, 270, 20, col::TEXT, "Всё обновлено");
-        gfx::text_center(gfx::regular, W / 2, 298, 15, col::MUTED, "Когда выйдут новые версии, они появятся здесь");
+        gfx::mascot(W / 2 - 70, 112, 140, 0.95f);
+        gfx::text_center(gfx::bold, W / 2, 300, 20, col::TEXT, "Всё обновлено");
+        gfx::text_center(gfx::regular, W / 2, 328, 15, col::MUTED, "Когда выйдут новые версии, они появятся здесь");
         return;
     }
     float y = GRID_TOP + 4;
@@ -499,7 +728,7 @@ void App::draw_updates()
         if (on)
             gfx::rframe(28, y, W - 56, 72, 14, 2, alt ? col::ORANGE : col::ACCENT);
         float a = 0;
-        vita2d_texture* ic = images.get(icon_url(e), &a);
+        vita2d_texture* ic = images.get(icon_url(e), &a, IMG_THUMB);
         if (ic)
             gfx::fit_round(ic, 42, y + 12, 48, 48, 10, a);
         else
@@ -664,6 +893,32 @@ int App::refresh_thread(unsigned int, void* arg)
     c->load_pkgj();
     c->apply_covers();
     c->load_updates();
+    c->prepare();
+    if (c->app_url.empty()) {
+        std::string rel, rerr;
+        if (net::get("https://api.github.com/repos/" APP_REPO "/releases/latest", rel, rerr)) {
+            Json::CharReaderBuilder rb;
+            Json::Value root;
+            std::string errs;
+            std::istringstream in(rel);
+            if (Json::parseFromStream(rb, in, &root, &errs) && root.isObject()) {
+                std::string tag = root["tag_name"].isString() ? root["tag_name"].asString() : "";
+                while (!tag.empty() && !isdigit((unsigned char)tag[0]))
+                    tag.erase(0, 1);
+                for (const auto& a : root["assets"]) {
+                    std::string u = a["browser_download_url"].isString() ? a["browser_download_url"].asString() : "";
+                    if (ends_with(lower(u), ".vpk")) {
+                        c->app_url = u;
+                        break;
+                    }
+                }
+                if (!c->app_url.empty()) {
+                    c->app_version = tag;
+                    c->app_notes = root["body"].isString() ? root["body"].asString() : "";
+                }
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(a->refresh_m);
         a->fresh = std::move(c);
@@ -697,6 +952,8 @@ void App::apply_refresh()
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
         notify_updates();
+        if (!app_prompted)
+            ask_app_update(false);
         if (!refresh_err.empty()) {
             if (manual_refresh || !loaded_once)
                 show_toast("Не удалось обновить каталог: " + refresh_err);
@@ -1121,6 +1378,8 @@ void App::input()
                 tasks.clear_finished();
                 dl_sel = 0;
             }
+            if ((pressed & SCE_CTRL_SELECT) && bg_left)
+                cancel_background();
             if ((pressed & ok_btn) && dl_sel < (int)list.size()) {
                 auto t = list[dl_sel];
                 if (t->state == TS_RUNNING || t->state == TS_QUEUED) {
@@ -1223,7 +1482,9 @@ void App::input()
             primary_action();
         if ((pressed & SCE_CTRL_TRIANGLE) && detail.cat == CAT_GAMES)
             background_download(detail);
-        else if ((pressed & SCE_CTRL_TRIANGLE) && !detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0)
+        else if ((pressed & SCE_CTRL_TRIANGLE) && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
+            queue_background(detail);
+        if ((pressed & SCE_CTRL_LTRIGGER) && !detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0)
             ask_alt(detail);
         if ((pressed & SCE_CTRL_RTRIGGER) && has_saves)
             saves_menu(detail);
@@ -1292,50 +1553,22 @@ void App::input()
     }
 
     if (screen == SCR_SETTINGS) {
+        int n = (int)settings_actions.size();
         if (act & SCE_CTRL_UP)
             settings_sel = std::max(0, settings_sel - 1);
         if (act & SCE_CTRL_DOWN)
-            settings_sel = std::min(6, settings_sel + 1);
+            settings_sel = std::min(std::max(0, n - 1), settings_sel + 1);
         if (pressed & (back_btn | SCE_CTRL_START | SCE_CTRL_SELECT)) {
             screen = SCR_BROWSE;
             return;
         }
-        if (pressed & ok_btn) {
-            switch (settings_sel) {
-            case 0:
-                ime_purpose = IME_REPO;
-                ime::open("Репозиторий каталога (user/repo)", settings.repo, 100);
-                break;
-            case 1:
-                ime_purpose = IME_BRANCH;
-                ime::open("Ветка", settings.branch, 60);
-                break;
-            case 2:
-                start_refresh(true);
-                break;
-            case 3:
-                images.clear_disk();
-                show_toast("Кеш картинок очищен");
-                break;
-            case 4:
-                if (tasks.active()) {
-                    show_toast("Дождись окончания загрузок");
-                } else {
-                    fs::rmtree(APP_DIR + "/dl");
-                    fs::rmtree("ux0:temp/vpkgj");
-                    fs::mkdirs(APP_DIR + "/dl");
-                    fs::mkdirs("ux0:temp/vpkgj");
-                    show_toast("Временные файлы удалены");
-                }
-                break;
-            case 5:
-                open_backups();
-                break;
-            case 6:
-                toggle_daemon();
-                break;
-            }
+        if (settings_sel == 4 && (act & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))) {
+            speed_mode = (speed_mode + ((act & SCE_CTRL_LEFT) ? 4 : 1)) % 5;
+            save_prefs();
+            apply_speed();
         }
+        if ((pressed & ok_btn) && settings_sel < n)
+            settings_actions[settings_sel]();
     }
 }
 
@@ -1349,9 +1582,10 @@ void App::draw_badge(float x, float y, const std::string& s, unsigned bg, unsign
 void App::draw_header()
 {
     hits.push_back({0, 0, (float)W, (float)HEADER_H, []() {}});
-    gfx::text(gfx::bold, 28, 41, 24, col::TEXT, "VPKGJ");
-    gfx::circle(108, 33, 3.5f, col::ACCENT);
-    float x = 132;
+    gfx::circle(42, 33, 20, gfx::alpha(col::ACCENT, 0.35f));
+    gfx::logo(24, 15, 36);
+    hits.push_back({20, 12, 44, 44, [this]() { screen = SCR_SETTINGS; }});
+    float x = 74;
     gfx::button(BTN_L, x, 23, 20);
     x += 34;
     for (int t = 0; t < TAB_COUNT; t++) {
@@ -1387,10 +1621,10 @@ void App::draw_card(const Entry& e, float x, float y)
     gfx::rrect(x, y, CARD_W, CARD_H, 14, col::SURFACE);
     float a = 0;
     vita2d_texture* img = nullptr;
-    vita2d_texture* icon = images.get(icon_url(e), &a);
+    vita2d_texture* icon = images.get(icon_url(e), &a, IMG_THUMB);
     float ia = a;
     if (!e.shots.empty())
-        img = images.get(catalog.media_url(e.shots[0]), &a);
+        img = images.get(catalog.media_url(e.shots[0]), &a, IMG_THUMB);
     if (img) {
         if (a < 1)
             gfx::placeholder_round(x, y, CARD_W, CARD_IMG_H, 14, e.name, 34);
@@ -1462,7 +1696,9 @@ void App::draw_grid()
 {
     auto& f = filtered[tab];
     if (f.empty()) {
-        float cy = 280;
+        float cy = 300;
+        if (!(refreshing == 1 && !loaded_once))
+            gfx::mascot(W / 2 - 70, 112, 140, 0.95f);
         if (refreshing == 1 && !loaded_once) {
             gfx::spinner(W / 2, cy - 20, 12, col::ACCENT);
             gfx::text_center(gfx::regular, W / 2, cy + 22, 16, col::MUTED, "Загружаю каталог...");
@@ -1500,10 +1736,25 @@ void App::draw_grid()
     fy += (sy - fy) * 0.3f;
     gfx::rrect(fx - 4, fy - 4, CARD_W + 8, CARD_H + 8, 17, col::ACCENT);
     gfx::rrect(fx - 1, fy - 1, CARD_W + 2, CARD_H + 2, 15, col::BG);
-    for (int i = 0; i < (int)f.size(); i++) {
+    float row_h = CARD_H + GAP_Y;
+    int first_row = std::max(0, (int)((HEADER_H - 20 - top - CARD_H) / row_h));
+    int last_row = (int)((FOOTER_Y + 10 - top) / row_h);
+    bool down = scroll_target[tab] >= scroll[tab];
+    int pre_from = std::max(0, down ? last_row + 1 : first_row - 3);
+    int pre_to = down ? last_row + 3 : first_row - 1;
+    for (int r = pre_from; r <= pre_to; r++)
+        for (int k = r * COLS; k < (r + 1) * COLS && k < (int)f.size(); k++) {
+            const Entry& e = catalog.items[tab][f[k]];
+            if (!e.shots.empty())
+                images.prefetch(catalog.media_url(e.shots[0]), IMG_THUMB);
+            images.prefetch(icon_url(e), IMG_THUMB);
+        }
+    for (int i = first_row * COLS; i < (int)f.size(); i++) {
         float x = GRID_X + (i % COLS) * (CARD_W + GAP_X);
         float y = top + (i / COLS) * (CARD_H + GAP_Y);
-        if (y + CARD_H < HEADER_H - 20 || y > FOOTER_Y + 10)
+        if (y > FOOTER_Y + 10)
+            break;
+        if (y + CARD_H < HEADER_H - 20)
             continue;
         const Entry& e = catalog.items[tab][f[i]];
         draw_card(e, x, y);
@@ -1547,21 +1798,33 @@ void App::draw_detail()
     }
     float fade = std::min(1.0f, (now_ms() - shot_time) / 350.0f);
     float ia = 0;
-    vita2d_texture* icon = images.get(icon_url(e), &ia);
+    vita2d_texture* icon = images.get(icon_url(e), &ia, IMG_THUMB);
     if (n) {
+        std::string cur_url = catalog.media_url(e.shots[shot]);
         if (prev_shot >= 0 && fade < 1) {
-            vita2d_texture* p = images.get(catalog.media_url(e.shots[prev_shot]));
+            std::string pu = catalog.media_url(e.shots[prev_shot]);
+            vita2d_texture* p = images.peek(pu, IMG_FULL);
+            if (!p)
+                p = images.peek(pu, IMG_THUMB);
             if (p)
                 gfx::cover(p, 0, 0, W, HERO, 1);
         }
         float a = 0;
-        vita2d_texture* cur = images.get(catalog.media_url(e.shots[shot]), &a);
+        vita2d_texture* cur = images.get(cur_url, &a, IMG_FULL);
+        float sa = std::min(a, prev_shot >= 0 ? fade : 1.0f);
+        if (!cur || a < 1) {
+            vita2d_texture* low = images.peek(cur_url, IMG_THUMB);
+            if (low)
+                gfx::cover(low, 0, 0, W, HERO, prev_shot >= 0 ? fade : 1.0f);
+            else if (!cur)
+                gfx::spinner(W / 2, HERO / 2, 12, col::MUTED);
+        }
         if (cur)
-            gfx::cover(cur, 0, 0, W, HERO, std::min(a, prev_shot >= 0 ? fade : 1.0f));
-        else
-            gfx::spinner(W / 2, HERO / 2, 12, col::MUTED);
+            gfx::cover(cur, 0, 0, W, HERO, sa);
         for (int i = 1; i < 3 && i < n; i++)
-            images.get(catalog.media_url(e.shots[(shot + i) % n]));
+            images.prefetch(catalog.media_url(e.shots[(shot + i) % n]), IMG_FULL);
+        if (n > 1)
+            images.prefetch(catalog.media_url(e.shots[(shot + n - 1) % n]), IMG_FULL);
     } else {
         gfx::placeholder(0, 0, W, HERO, e.name, 0);
         if (icon)
@@ -1686,7 +1949,7 @@ void App::draw_detail()
         chip(detail_deps[i].name + (detail_dep_ok[i] ? ": есть" : detail_deps[i].url.empty() ? ": нет, см. описание" : ": поставится сам"),
              detail_dep_ok[i] ? col::GREEN : detail_deps[i].url.empty() ? col::RED : col::ORANGE);
     if (!e.alt_url.empty() && version_cmp(e.version, e.alt_version) < 0)
-        chip("Есть новее у автора: " + e.alt_version + " (△, на свой риск)", col::ORANGE);
+        chip("Есть новее у автора: " + e.alt_version + " (L, на свой риск)", col::ORANGE);
     if (st == ST_INSTALLED)
         chip("Установлено", col::GREEN);
     if (st == ST_UPDATE)
@@ -1707,7 +1970,7 @@ void App::draw_detail()
         float y = top + 16 + i * lh - desc_scroll;
         if (y < top - lh || y > bottom + lh)
             continue;
-        gfx::text(gfx::regular, 32, y, 15, RGBA8(205, 209, 218, 255), desc_lines[i]);
+        gfx::text(gfx::regular, 32, y, 15, RGBA8(214, 210, 232, 255), desc_lines[i]);
     }
     vita2d_disable_clipping();
     if (maxs > 0) {
@@ -1824,6 +2087,226 @@ void App::toggle_daemon()
     };
 }
 
+static const char* SPEED_NAMES[] = {"Без ограничения", "4 МБ/с", "2 МБ/с", "1 МБ/с", "512 КБ/с"};
+static const uint64_t SPEED_VALUES[] = {0, 4ull << 20, 2ull << 20, 1ull << 20, 512ull << 10};
+
+void App::load_prefs()
+{
+    std::string s;
+    if (!fs::read(APP_DIR + "/prefs.txt", s))
+        return;
+    int v = 0;
+    if (sscanf(s.c_str(), "speed=%d", &v) == 1 && v >= 0 && v < 5)
+        speed_mode = v;
+}
+
+void App::save_prefs()
+{
+    fs::write(APP_DIR + "/prefs.txt", "speed=" + std::to_string(speed_mode) + "\n");
+}
+
+void App::apply_speed()
+{
+    net::set_speed_limit(SPEED_VALUES[speed_mode]);
+}
+
+static int count_lines(const std::string& s)
+{
+    int n = 0;
+    for (char c : s)
+        if (c == '\n')
+            n++;
+    return n;
+}
+
+void App::poll_bg()
+{
+    if (now_ms() - bg_polled < 1500)
+        return;
+    bg_polled = now_ms();
+    std::string q, add, st;
+    fs::read(APP_DIR + "/bgq.txt", q);
+    fs::read(APP_DIR + "/bgq.add", add);
+    bg_left = count_lines(q) + count_lines(add);
+    bg_name.clear();
+    bg_done = bg_total = 0;
+    if (bg_left && fs::read(APP_DIR + "/bgstate.txt", st)) {
+        size_t a = st.find('\t');
+        size_t b = a == std::string::npos ? a : st.find('\t', a + 1);
+        if (b != std::string::npos) {
+            unsigned d = 0, t = 0;
+            bg_name = st.substr(a + 1, b - a - 1);
+            sscanf(st.c_str() + b + 1, "%u\t%u", &d, &t);
+            bg_done = (uint64_t)d * 1024;
+            bg_total = (uint64_t)t * 1024;
+        }
+    }
+    std::string done;
+    if (!fs::read(APP_DIR + "/bgdone.txt", done) || done.empty())
+        return;
+    sceIoRemove((APP_DIR + "/bgdone.work").c_str());
+    if (sceIoRename((APP_DIR + "/bgdone.txt").c_str(), (APP_DIR + "/bgdone.work").c_str()) < 0)
+        return;
+    fs::read(APP_DIR + "/bgdone.work", done);
+    sceIoRemove((APP_DIR + "/bgdone.work").c_str());
+    int added = 0;
+    size_t pos = 0;
+    while (pos < done.size()) {
+        size_t n = done.find('\n', pos);
+        std::string key = trim(done.substr(pos, n == std::string::npos ? std::string::npos : n - pos));
+        pos = n == std::string::npos ? done.size() : n + 1;
+        size_t s1 = key.find('/');
+        size_t s2 = s1 == std::string::npos ? s1 : key.find('/', s1 + 1);
+        if (s2 == std::string::npos)
+            continue;
+        std::string cat = key.substr(0, s1), id = key.substr(s1 + 1, s2 - s1 - 1), ver = key.substr(s2 + 1);
+        for (int c = 0; c < CAT_COUNT; c++) {
+            if (cat != category_key((Category)c))
+                continue;
+            const Entry* best = nullptr;
+            for (auto& e : catalog.items[c])
+                if (e.id == id && (!best || e.version == ver))
+                    best = &e;
+            if (best) {
+                tasks.add(*best, deps_of(*best));
+                added++;
+            }
+        }
+    }
+    if (added)
+        show_toast("Скачано в фоне, ставлю: " + std::to_string(added));
+}
+
+void App::ask_daemon()
+{
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Нужна фоновая служба";
+    modal.lines.push_back("Порты, хоумбрю и переводы качает в фоне демон VPKGJ.");
+    modal.lines.push_back("Он работает даже когда приложение закрыто и шлёт уведомление,");
+    modal.lines.push_back("а установка займёт пару секунд при следующем запуске VPKGJ.");
+    modal.yes = "Включить";
+    modal.action = [this]() { toggle_daemon(); };
+}
+
+void App::queue_background(const Entry& e)
+{
+    if (!daemon_enabled()) {
+        ask_daemon();
+        return;
+    }
+    std::vector<std::string> urls;
+    auto split_by = [](const std::string& s, char sep) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (char c : s + sep) {
+            if (c == sep) {
+                if (!trim(cur).empty())
+                    out.push_back(trim(cur));
+                cur.clear();
+            } else {
+                cur += c;
+            }
+        }
+        return out;
+    };
+    if (e.cat == CAT_TRANSLATIONS) {
+        for (auto& part : split_by(e.url, ';'))
+            urls.push_back(first_link(part));
+    } else {
+        urls.push_back(first_link(e.url));
+        if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW)
+            for (auto& part : split_by(e.data, ';')) {
+                std::string src = part;
+                size_t gt = src.find('>');
+                if (gt != std::string::npos)
+                    src = trim(src.substr(0, gt));
+                urls.push_back(first_link(src));
+            }
+    }
+    std::string key = std::string(category_key(e.cat)) + "/" + e.id + "/" + (e.version.empty() ? "-" : e.version);
+    std::string name = e.name;
+    for (auto& c : name)
+        if (c == '\t' || c == '\n' || c == '\r')
+            c = ' ';
+    std::string lines;
+    int skipped = 0;
+    for (auto& u : urls) {
+        if (u.empty())
+            continue;
+        if (u.find("google.com") != std::string::npos) {
+            skipped++;
+            continue;
+        }
+        lines += key + "\t" + name + "\t" + u + "\n";
+    }
+    if (lines.empty()) {
+        show_toast("Этот файл с Google Drive, его качает только приложение");
+        return;
+    }
+    std::string q;
+    fs::read(APP_DIR + "/bgq.add", q);
+    fs::write(APP_DIR + "/bgq.add", q + lines);
+    bg_polled = 0;
+    show_toast(skipped ? "В фоне скачается часть файлов, остальное докачает VPKGJ" : "Скачается в фоне, можно закрыть VPKGJ");
+}
+
+void App::cancel_background()
+{
+    fs::write(APP_DIR + "/bgq.stop", "1");
+    sceIoRemove((APP_DIR + "/bgq.add").c_str());
+    bg_polled = 0;
+    show_toast("Фоновые загрузки остановлены");
+}
+
+bool App::app_update_available()
+{
+    return !catalog.app_version.empty() && !catalog.app_url.empty() && version_cmp(VPKGJ_VERSION, catalog.app_version) < 0;
+}
+
+void App::ask_app_update(bool manual)
+{
+    if (!app_update_available()) {
+        if (manual)
+            show_toast(catalog.app_version.empty() ? "Не удалось узнать последнюю версию" : "У тебя последняя версия VPKGJ");
+        return;
+    }
+    if (!manual && (modal.on || ignored_app(catalog.app_version)))
+        return;
+    app_prompted = true;
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Вышел VPKGJ " + catalog.app_version;
+    modal.lines.push_back("Сейчас стоит " VPKGJ_VERSION ". Обновление скачается и встанет само,");
+    modal.lines.push_back("после этого VPKGJ перезапустится.");
+    std::string notes;
+    for (char c : catalog.app_notes)
+        if (c != '\r' && c != '#' && c != '*')
+            notes += c;
+    for (auto& l : gfx::wrap(gfx::regular, 15, trim(notes), 540))
+        if (modal.lines.size() < 7)
+            modal.lines.push_back(l);
+    modal.yes = "Обновить";
+    modal.action = [this]() {
+        Entry e;
+        e.cat = CAT_HOMEBREW;
+        e.id = "VPKG00001";
+        e.name = "VPKGJ " + catalog.app_version;
+        e.version = catalog.app_version;
+        e.url = catalog.app_url;
+        e.install = "self";
+        tasks.add(e);
+        set_tab(TAB_DOWNLOADS);
+        screen = SCR_BROWSE;
+    };
+    modal.alt = "Не напоминать";
+    std::string v = catalog.app_version;
+    modal.alt_action = [this, v]() {
+        fs::write(APP_DIR + "/app_skip.txt", v);
+        show_toast("Напомню, когда выйдет следующая версия");
+    };
+}
+
 void App::check_reboot()
 {
     if (modal.on)
@@ -1843,6 +2326,22 @@ void App::check_reboot()
                 installed.refresh();
                 refresh_updates();
             }
+        }
+        if (t->state == TS_DONE && t->restart && !t->notified) {
+            t->notified = true;
+            modal = Modal();
+            modal.on = true;
+            modal.title = "VPKGJ обновлён";
+            modal.lines.push_back("Новая версия установлена, нужен перезапуск приложения.");
+            if (tasks.active())
+                modal.lines.push_back("Остальные загрузки продолжатся после перезапуска с места остановки.");
+            modal.yes = "Перезапустить";
+            modal.action = [this]() {
+                tasks.stop();
+                images.stop();
+                sceAppMgrLoadExec("app0:eboot.bin", nullptr, nullptr);
+            };
+            return;
         }
         if (t->state == TS_DONE && t->reboot && !t->notified) {
             t->notified = true;
@@ -1905,19 +2404,25 @@ void App::draw_viewer()
     }
     float fade = std::min(1.0f, (now_ms() - shot_time) / 250.0f);
     if (prev_shot >= 0 && fade < 1) {
-        vita2d_texture* p = images.get(catalog.media_url(detail.shots[prev_shot]));
+        vita2d_texture* p = images.peek(catalog.media_url(detail.shots[prev_shot]), IMG_FULL);
         if (p)
             gfx::fit(p, 0, 0, W, H, 1 - fade);
     }
     float a = 0;
-    vita2d_texture* t = images.get(catalog.media_url(detail.shots[shot]), &a);
+    std::string url = catalog.media_url(detail.shots[shot]);
+    vita2d_texture* t = images.get(url, &a, IMG_FULL);
+    if (!t || a < 1) {
+        vita2d_texture* low = images.peek(url, IMG_THUMB);
+        if (low)
+            gfx::fit(low, 0, 0, W, H, fade);
+        else if (!t)
+            gfx::spinner(W / 2, H / 2, 14, col::MUTED);
+    }
     if (t)
         gfx::fit(t, 0, 0, W, H, std::min(a, fade));
-    else
-        gfx::spinner(W / 2, H / 2, 14, col::MUTED);
-    for (int i = 1; i <= 1 && n > 1; i++) {
-        images.get(catalog.media_url(detail.shots[(shot + i) % n]));
-        images.get(catalog.media_url(detail.shots[(shot + n - i) % n]));
+    if (n > 1) {
+        images.prefetch(catalog.media_url(detail.shots[(shot + 1) % n]), IMG_FULL);
+        images.prefetch(catalog.media_url(detail.shots[(shot + n - 1) % n]), IMG_FULL);
     }
     std::string c = std::to_string(shot + 1) + " / " + std::to_string(n);
     int w = gfx::width(gfx::bold, 14, c) + 24;
@@ -1973,7 +2478,7 @@ void App::draw_related()
         if (on)
             gfx::rframe(x, y, cw, ch, 14, 2, col::ACCENT);
         float a = 0;
-        vita2d_texture* ic = images.get(icon_url(r), &a);
+        vita2d_texture* ic = images.get(icon_url(r), &a, IMG_THUMB);
         if (ic)
             gfx::fit_round(ic, x + 10, y + 10, 54, 54, 10, a);
         else
@@ -2008,17 +2513,37 @@ void App::draw_downloads()
         gfx::button(BTN_SQUARE, W - 28 - 110, GRID_TOP + 7, 20);
         gfx::text(gfx::regular, W - 28 - 84, GRID_TOP + 22, 13, col::TEXT, "обновить всё");
     }
-    if (list.empty()) {
-        gfx::text_center(gfx::bold, W / 2, 270, 20, col::TEXT, "Загрузок нет");
-        gfx::text_center(gfx::regular, W / 2, 298, 15, col::MUTED, "Выбери игру или порт и нажми Установить");
-        gfx::text_center(gfx::regular, W / 2, 330, 14, col::MUTED, "Свободно на ux0: " + fmt_size(fs::free_space("ux0:")));
+    if (list.empty() && !bg_left) {
+        gfx::mascot(W / 2 - 70, 112, 140, 0.95f);
+        gfx::text_center(gfx::bold, W / 2, 300, 20, col::TEXT, "Загрузок нет");
+        gfx::text_center(gfx::regular, W / 2, 328, 15, col::MUTED, "Выбери игру или порт: поставить сразу или скачать в фоне");
+        gfx::text_center(gfx::regular, W / 2, 356, 14, col::MUTED, "Свободно на ux0: " + fmt_size(free_cached()));
         return;
     }
     if (dl_sel >= (int)list.size())
-        dl_sel = (int)list.size() - 1;
+        dl_sel = std::max(0, (int)list.size() - 1);
     float y = GRID_TOP + 4;
-    gfx::text(gfx::regular, 32, y + 12, 14, col::MUTED, "Свободно на ux0: " + fmt_size(fs::free_space("ux0:")));
+    gfx::text(gfx::regular, 32, y + 12, 14, col::MUTED, "Свободно на ux0: " + fmt_size(free_cached()));
     y += 28;
+    if (bg_left) {
+        gfx::rrect(28, y, W - 56, 60, 14, gfx::alpha(col::ACCENT, 0.12f));
+        gfx::rframe(28, y, W - 56, 60, 14, 1, gfx::alpha(col::ACCENT, 0.5f));
+        gfx::spinner(56, y + 30, 9, col::ACCENT);
+        std::string head = "В фоне через демон: файлов " + std::to_string(bg_left);
+        gfx::text(gfx::bold, 80, y + 25, 15, col::TEXT, head);
+        std::string sub = bg_name.empty() ? "Ждёт сеть или своей очереди" : bg_name;
+        if (bg_total)
+            sub += " · " + fmt_size(bg_done) + " из " + fmt_size(bg_total);
+        else if (bg_done)
+            sub += " · " + fmt_size(bg_done);
+        gfx::text(gfx::regular, 80, y + 46, 13, col::MUTED, gfx::ellipsize(gfx::regular, 13, sub, 560));
+        if (bg_total) {
+            float f = (float)bg_done / bg_total;
+            gfx::rrect(W - 46 - 160, y + 26, 160, 6, 3, col::LINE);
+            gfx::rrect(W - 46 - 160, y + 26, std::max(6.0f, 160 * f), 6, 3, col::ACCENT);
+        }
+        y += 70;
+    }
     int first = std::max(0, dl_sel - 4);
     uint64_t now = now_ms();
     for (int i = first; i < (int)list.size() && y < FOOTER_Y - 70; i++) {
@@ -2028,7 +2553,7 @@ void App::draw_downloads()
         if (on)
             gfx::rframe(28, y, W - 56, 72, 14, 2, col::ACCENT);
         float a = 0;
-        vita2d_texture* icon = images.get(icon_url(t->entry), &a);
+        vita2d_texture* icon = images.get(icon_url(t->entry), &a, IMG_THUMB);
         if (icon) {
             gfx::fit(icon, 42, y + 12, 48, 48, a);
             gfx::corners(42, y + 12, 48, 48, 10, on ? col::SURFACE2 : col::SURFACE);
@@ -2080,49 +2605,105 @@ void App::draw_downloads()
 void App::draw_settings()
 {
     gfx::text(gfx::bold, 32, 46, 24, col::TEXT, "Настройки");
-    gfx::text_right(gfx::regular, W - 32, 44, 14, col::MUTED, "VPKGJ " VPKGJ_VERSION);
     struct Row {
         std::string title, value;
+        unsigned vc;
+        std::function<void()> fn;
     };
+    bool upd = app_update_available();
     std::vector<Row> rows = {
-        {"Репозиторий каталога", settings.repo},
-        {"Ветка", settings.branch},
-        {"Обновить каталог", catalog.version.empty() ? "" : "версия " + catalog.version},
-        {"Очистить кеш картинок", ""},
-        {"Удалить временные файлы загрузок", ""},
-        {"Резервные копии", "config.txt, rePatch, сохранения"},
-        {"Фоновая проверка обновлений", daemon_enabled() ? "включена" : "выключена"},
+        {"Обновление VPKGJ", upd ? "есть " + catalog.app_version + ", поставить" : "у тебя " VPKGJ_VERSION, upd ? col::ORANGE : col::MUTED,
+         [this, upd]() {
+             if (upd)
+                 ask_app_update(true);
+             else {
+                 start_refresh(true);
+                 show_toast("Проверяю обновления");
+             }
+         }},
+        {"Репозиторий каталога", settings.repo, col::MUTED, [this]() {
+             ime_purpose = IME_REPO;
+             ime::open("Репозиторий каталога (user/repo)", settings.repo, 100);
+         }},
+        {"Ветка", settings.branch, col::MUTED, [this]() {
+             ime_purpose = IME_BRANCH;
+             ime::open("Ветка", settings.branch, 60);
+         }},
+        {"Обновить каталог", catalog.version.empty() ? "" : "версия " + catalog.version, col::MUTED, [this]() { start_refresh(true); }},
+        {"Скорость загрузки", std::string("‹ ") + SPEED_NAMES[speed_mode] + " ›", speed_mode ? col::ACCENT : col::MUTED, [this]() {
+             speed_mode = (speed_mode + 1) % 5;
+             save_prefs();
+             apply_speed();
+         }},
+        {"Фоновая служба", daemon_enabled() ? "включена" : "выключена", daemon_enabled() ? col::GREEN : col::MUTED, [this]() { toggle_daemon(); }},
+        {"Резервные копии", "config.txt, rePatch, сейвы", col::MUTED, [this]() { open_backups(); }},
+        {"Очистить кеш картинок", "", col::MUTED, [this]() {
+             images.clear_disk();
+             show_toast("Кеш картинок очищен");
+         }},
+        {"Удалить временные файлы", "", col::MUTED, [this]() {
+             if (tasks.active()) {
+                 show_toast("Дождись окончания загрузок");
+                 return;
+             }
+             fs::rmtree(APP_DIR + "/dl");
+             fs::rmtree("ux0:temp/vpkgj");
+             fs::mkdirs(APP_DIR + "/dl");
+             fs::mkdirs("ux0:temp/vpkgj");
+             show_toast("Временные файлы удалены");
+         }},
     };
-    std::string pc = pkgj_config_path();
-    float y = 76;
+    settings_actions.clear();
+    if (settings_sel >= (int)rows.size())
+        settings_sel = (int)rows.size() - 1;
+    float y = 68, rw = 600;
     for (int i = 0; i < (int)rows.size(); i++) {
         bool on = i == settings_sel;
-        gfx::rrect(28, y, W - 56, 44, 12, on ? col::SURFACE2 : col::SURFACE);
+        gfx::rrect(28, y, rw, 40, 12, on ? col::SURFACE2 : gfx::alpha(col::SURFACE, 0.9f));
         if (on)
-            gfx::rframe(28, y, W - 56, 44, 12, 2, col::ACCENT);
-        gfx::text(gfx::regular, 48, y + 28, 16, col::TEXT, rows[i].title);
-        gfx::text_right(gfx::regular, W - 48, y + 28, 15, col::MUTED, rows[i].value);
+            gfx::rframe(28, y, rw, 40, 12, 2, col::ACCENT);
+        gfx::text(on ? gfx::bold : gfx::regular, 46, y + 26, 15, col::TEXT, rows[i].title);
+        gfx::text_right(gfx::regular, 28 + rw - 18, y + 26, 14, rows[i].vc, gfx::ellipsize(gfx::regular, 14, rows[i].value, 300));
+        settings_actions.push_back(rows[i].fn);
         int idx = i;
-        hits.push_back({28, y, (float)(W - 56), 44, [this, idx]() {
-                            if (settings_sel == idx && idx == 5)
-                                open_backups();
-                            if (settings_sel == idx && idx == 6)
-                                toggle_daemon();
+        hits.push_back({28, y, rw, 40, [this, idx]() {
+                            if (settings_sel == idx && idx < (int)settings_actions.size())
+                                settings_actions[idx]();
                             settings_sel = idx;
                         }});
-        y += 50;
+        y += 44;
     }
-    y += 8;
+    draw_about(68);
+}
+
+void App::draw_about(float y)
+{
+    float x = 646, w = W - 28 - x, h = FOOTER_Y - 12 - y;
+    gfx::rrect(x, y, w, h, 18, gfx::alpha(col::SURFACE, 0.92f));
+    gfx::rframe(x, y, w, h, 18, 1, col::LINE);
+    gfx::vgrad(x + 1, y + 1, w - 2, 160, gfx::alpha(col::ACCENT2, 0.22f), gfx::alpha(col::ACCENT2, 0));
+    gfx::mascot(x + w / 2 - 70, y + 14, 140, 1);
+    float ty = y + 186;
+    gfx::text_center(gfx::bold, x + w / 2, ty, 26, col::TEXT, "VPKGJ");
+    gfx::text_center(gfx::regular, x + w / 2, ty + 22, 13, col::MUTED, "версия " VPKGJ_VERSION " · магазин для PS Vita");
+    ty += 52;
+    gfx::rrect(x + 16, ty, w - 32, 54, 14, gfx::alpha(col::BG, 0.6f));
+    gfx::text(gfx::regular, x + 30, ty + 22, 12, col::MUTED, "Автор");
+    gfx::text(gfx::bold, x + 30, ty + 42, 16, col::TEXT, VPKGJ_AUTHOR);
+    gfx::text_right(gfx::bold, x + w - 30, ty + 42, 14, col::ACCENT, VPKGJ_TG);
+    ty += 66;
+    std::string pc = pkgj_config_path();
     std::vector<std::string> about = {
-        "Свободно на ux0: " + fmt_size(fs::free_space("ux0:")) + " · плагины: " + tai_dir() + "/config.txt",
-        pc.empty() ? "Списки pkgj: не найден ux0:pkgj/config.txt"
-                   : "Списки pkgj из " + pc + ": игр " + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
-        "Каталог: github.com/" + settings.repo + " · приложение: github.com/Risaro/vpkgj",
-        "Лицензия GPL-3.0. Установка PKG по мотивам pkgj, установка vpk по мотивам VitaShell и VitaDB Downloader.",
+        "Свободно на ux0: " + fmt_size(free_cached()),
+        pc.empty() ? "Списки pkgj не найдены" : "pkgj: игр " + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
+        "github.com/" APP_REPO,
+        "GPL-3.0 · по мотивам pkgj и VitaShell",
     };
-    for (auto& s : about) {
-        gfx::text(gfx::regular, 32, y + 16, 13, col::MUTED, gfx::ellipsize(gfx::regular, 13, s, W - 64));
-        y += 22;
+    for (auto& l : about) {
+        if (ty + 16 > y + h)
+            break;
+        gfx::text(gfx::regular, x + 20, ty + 14, 12, col::MUTED, gfx::ellipsize(gfx::regular, 12, l, (int)w - 40));
+        ty += 20;
     }
 }
 
@@ -2165,6 +2746,8 @@ void App::draw_footer()
         if (updates_count)
             x = gfx::hint(x, y, BTN_SQUARE, "Обновить всё");
         x = gfx::hint(x, y, BTN_TRIANGLE, "Очистить готовые");
+        if (bg_left)
+            x = gfx::hint(x, y, BTN_SELECT, "Стоп фон");
         gfx::hint(x, y, BTN_START, "Настройки");
     } else if (screen == SCR_DETAIL && rel_sel >= 0) {
         x = gfx::hint(x, y, ok_icon, "Открыть");
@@ -2178,10 +2761,10 @@ void App::draw_footer()
         x = gfx::hint(x, y, ok_icon, ok);
         if (st != ST_NONE && !busy)
             x = gfx::hint(x, y, BTN_SQUARE, "Переустановить");
-        if (detail.cat == CAT_GAMES && !busy)
+        if (!busy && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
             x = gfx::hint(x, y, BTN_TRIANGLE, "В фоне");
-        else if (!detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0 && !busy)
-            x = gfx::hint(x, y, BTN_TRIANGLE, "Версия " + detail.alt_version);
+        if (!detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0 && !busy)
+            x = gfx::hint(x, y, BTN_L, "Версия " + detail.alt_version);
         if (has_saves)
             x = gfx::hint(x, y, BTN_R, "Сохранения");
         x = gfx::hint(x, y, back_icon, "Назад");
@@ -2316,6 +2899,10 @@ void App::run()
     catalog.load_pkgj();
     catalog.apply_covers();
     catalog.load_updates();
+    catalog.prepare();
+    load_views();
+    load_prefs();
+    apply_speed();
     rebuild();
     if (fs::exists(DAEMON_PATH)) {
         std::string a, b;
@@ -2329,6 +2916,8 @@ void App::run()
     for (;;) {
         apply_refresh();
         check_reboot();
+        poll_bg();
+        images.set_busy(tasks.active() > 0);
         if (ime::active()) {
             std::string text;
             int r = ime::poll(text);
@@ -2367,6 +2956,7 @@ int main()
     memset(&ip, 0, sizeof(ip));
     memset(&bp, 0, sizeof(bp));
     sceAppUtilInit(&ip, &bp);
+    sceKernelChangeThreadCpuAffinityMask(sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_0);
     scePowerSetArmClockFrequency(444);
     scePowerSetBusClockFrequency(222);
     scePowerSetGpuClockFrequency(222);

@@ -118,12 +118,24 @@ bool Catalog::parse(const std::string& json, std::string& err)
             while ((nl = e.description.find("\\n")) != std::string::npos)
                 e.description.replace(nl, 2, "\n");
             e.search = lower(e.name + " " + e.id + " " + e.author);
+            e.sort_name = lower(e.name);
+            e.date = str(v, "date");
+            if (e.date.empty())
+                e.date = str(v, "updated");
             if (!e.id.empty() && !e.name.empty())
                 items[c].push_back(std::move(e));
         }
     }
     version = str(root, "version");
     media = str(root, "media");
+    const Json::Value& app = root["app"];
+    if (app.isObject()) {
+        app_version = str(app, "version");
+        app_url = str(app, "vpk");
+        if (app_url.empty())
+            app_url = str(app, "url");
+        app_notes = str(app, "notes");
+    }
     return true;
 }
 
@@ -256,6 +268,8 @@ static int load_nps(std::vector<Entry>& out, const std::string& path, bool dlc)
         else if (f.size() > 10 && !f[10].empty())
             e.version = "FW " + f[10];
         e.search = lower(e.name + " " + e.id + (dlc ? " dlc" : ""));
+        e.sort_name = lower(e.name);
+        e.date = f[6];
         out.push_back(std::move(e));
         n++;
     }
@@ -356,6 +370,19 @@ void Catalog::load_updates()
     fs::read(APP_DIR + "/game_versions.txt", old);
     if (old != out)
         fs::write(APP_DIR + "/game_versions.txt", out);
+}
+
+void Catalog::prepare()
+{
+    std::set<std::string> tr;
+    for (auto& t : items[CAT_TRANSLATIONS])
+        tr.insert(t.id);
+    for (int c = 0; c < CAT_COUNT; c++)
+        for (auto& e : items[c]) {
+            if (e.sort_name.empty())
+                e.sort_name = lower(e.name);
+            e.ru = lower(e.lang).find("ru") != std::string::npos || (c != CAT_TRANSLATIONS && tr.count(e.id));
+        }
 }
 
 const Entry* Catalog::patch_for(const Entry& e) const

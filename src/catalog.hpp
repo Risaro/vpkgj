@@ -38,6 +38,9 @@ struct Entry {
     std::string icon;
     std::vector<std::string> shots;
     std::string search;
+    std::string sort_name;
+    std::string date;
+    bool ru = false;
 };
 
 enum Status { ST_NONE, ST_INSTALLED, ST_UPDATE };
@@ -55,6 +58,9 @@ public:
     std::vector<Entry> items[CAT_COUNT];
     std::string version;
     std::string media;
+    std::string app_version;
+    std::string app_url;
+    std::string app_notes;
 
     int pkgj_games = 0;
     int pkgj_dlcs = 0;
@@ -64,6 +70,7 @@ public:
     void load_pkgj();
     void apply_covers();
     void load_updates();
+    void prepare();
     const Entry* patch_for(const Entry& e) const;
     std::map<std::string, Entry> patches;
     std::map<std::string, std::string> game_versions;
