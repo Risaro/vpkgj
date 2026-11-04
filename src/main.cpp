@@ -36,7 +36,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.2"
+#define VPKGJ_VERSION "1.3"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -999,6 +999,8 @@ void App::apply_refresh()
         images.set_media(catalog.media);
         loaded_once = loaded_once || refresh_err.empty();
         rebuild();
+        if (!app_prompted)
+            ask_app_update(false);
         notify_updates();
         if (!pre_checked) {
             pre_checked = true;
@@ -1014,8 +1016,6 @@ void App::apply_refresh()
             if (trim(mark) != catalog.media + "|" + catalog.version + "|" + catalog.pack_id)
                 start_preload();
         }
-        if (!app_prompted)
-            ask_app_update(false);
         if (!refresh_err.empty()) {
             if (manual_refresh || !loaded_once)
                 show_toast("Не удалось обновить каталог: " + refresh_err);
