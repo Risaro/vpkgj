@@ -2718,7 +2718,7 @@ void App::start_preload()
             if (!e.shots.empty())
                 urls.push_back(catalog.media_url(e.shots[0]));
         }
-    images.preload(urls);
+    images.preload(urls, catalog.media);
     pre_t = now_ms();
     pre_b = 0;
     pre_speed = 0;
@@ -2750,6 +2750,13 @@ void App::draw_preload()
         live += l.done;
     uint64_t bytes = p.bytes + live;
     uint64_t now = now_ms();
+    static int last_stage = -1;
+    if (p.stage != last_stage) {
+        last_stage = p.stage;
+        pre_speed = 0;
+        pre_b = bytes;
+        pre_t = now;
+    }
     if (now - pre_t >= 1000) {
         double sp = (double)(bytes > pre_b ? bytes - pre_b : 0) * 1000.0 / (double)(now - pre_t);
         pre_speed = pre_speed == 0 ? sp : pre_speed * 0.6 + sp * 0.4;
@@ -2761,6 +2768,44 @@ void App::draw_preload()
         gfx::text_center(gfx::bold, W / 2, 222, 26, col::TEXT, "Готовлю VPKGJ");
         gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Загружаю каталог...");
         gfx::spinner(W / 2, 300, 12, col::ACCENT);
+        gfx::text_center(gfx::regular, W / 2, 400, 13, col::MUTED, "Сделано специально для");
+        gfx::text_center(gfx::bold, W / 2, 422, 17, col::ACCENT2, VPKGJ_FOR);
+        gfx::text_center(gfx::regular, W / 2, 450, 13, col::MUTED, "by " VPKGJ_AUTHOR " · " VPKGJ_TG);
+        return;
+    }
+    int stage = p.stage;
+    if (stage < 3) {
+        gfx::mascot(W / 2 - 75, 36, 150, 1);
+        gfx::text_center(gfx::bold, W / 2, 222, 26, col::TEXT, "Готовлю VPKGJ");
+        float bx = 180, bw = W - 360, by = 284;
+        if (stage == 0) {
+            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Проверяю, что уже скачано...");
+            gfx::spinner(W / 2, by + 10, 12, col::ACCENT);
+        } else if (stage == 1) {
+            uint64_t d = p.live[0].done, t = p.live[0].total;
+            float f = t ? (float)d / t : 0;
+            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Качаю архив с обложками и скриншотами одним файлом");
+            gfx::rrect(bx, by, bw, 18, 9, col::SURFACE2);
+            if (f > 0)
+                gfx::rrect(bx, by, std::max(18.0f, bw * f), 18, 9, col::ACCENT);
+            gfx::text(gfx::bold, bx, by + 46, 18, col::TEXT, std::to_string((int)(f * 100)) + "%");
+            gfx::text_right(gfx::regular, bx + bw, by + 46, 15, col::MUTED, fmt_size(d) + (t ? " из " + fmt_size(t) : ""));
+            std::string info = fmt_size((uint64_t)pre_speed) + "/с";
+            if (pre_speed > 1024 && t > d) {
+                int left = (int)((t - d) / pre_speed);
+                info += " · осталось ~" + (left >= 60 ? std::to_string(left / 60) + " мин" : std::to_string(left) + " с");
+            }
+            gfx::text_center(gfx::regular, W / 2, by + 46, 15, col::ACCENT2, info);
+        } else {
+            int ut = std::max(1, p.unpack_total.load()), ud = std::min(p.unpacked.load(), ut);
+            float f = (float)ud / ut;
+            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Раскладываю картинки по кешу");
+            gfx::rrect(bx, by, bw, 18, 9, col::SURFACE2);
+            if (f > 0)
+                gfx::rrect(bx, by, std::max(18.0f, bw * f), 18, 9, col::ACCENT2);
+            gfx::text(gfx::bold, bx, by + 46, 18, col::TEXT, std::to_string((int)(f * 100)) + "%");
+            gfx::text_right(gfx::regular, bx + bw, by + 46, 15, col::MUTED, std::to_string(ud) + " из " + std::to_string(p.unpack_total.load()));
+        }
         gfx::text_center(gfx::regular, W / 2, 400, 13, col::MUTED, "Сделано специально для");
         gfx::text_center(gfx::bold, W / 2, 422, 17, col::ACCENT2, VPKGJ_FOR);
         gfx::text_center(gfx::regular, W / 2, 450, 13, col::MUTED, "by " VPKGJ_AUTHOR " · " VPKGJ_TG);

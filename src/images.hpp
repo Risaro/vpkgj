@@ -35,6 +35,9 @@ struct Preload {
     std::atomic<uint64_t> bytes{0};
     std::atomic<int> running{0};
     std::atomic<bool> cancel{false};
+    std::atomic<int> stage{0};
+    std::atomic<int> unpacked{0};
+    std::atomic<int> unpack_total{0};
     net::Progress live[3];
 };
 
@@ -48,7 +51,7 @@ public:
     void tick();
     void clear_disk();
     void set_busy(bool b) { busy = b; }
-    void preload(const std::vector<std::string>& urls);
+    void preload(const std::vector<std::string>& urls, const std::string& media);
     void preload_stop();
     bool cached(const std::string& url);
     Preload pre;
@@ -68,6 +71,10 @@ private:
     static int decode_worker(unsigned int, void* arg);
     static int net_worker(unsigned int, void* arg);
     static int preload_worker(unsigned int, void* arg);
+    static int preload_main(unsigned int, void* arg);
+    void spawn_workers();
+    bool unpack(const std::string& zip);
+    std::string pre_media;
     Mutex pre_m;
     std::vector<std::string> pre_urls;
     size_t pre_next = 0;

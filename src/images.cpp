@@ -635,7 +635,7 @@ bool Images::cached(const std::string& url)
     return !remote(url) || fs::exists(disk_path(url));
 }
 
-void Images::preload(const std::vector<std::string>& urls)
+void Images::preload(const std::vector<std::string>& urls, const std::string& media)
 {
     preload_stop();
     {
@@ -646,11 +646,15 @@ void Images::preload(const std::vector<std::string>& urls)
             if (remote(u) && seen.insert(u).second)
                 pre_urls.push_back(u);
         pre_next = 0;
+        pre_media = media;
     }
     pre.total = (int)pre_urls.size();
     pre.done = 0;
     pre.failed = 0;
     pre.bytes = 0;
+    pre.stage = 0;
+    pre.unpacked = 0;
+    pre.unpack_total = 0;
     pre.cancel = false;
     for (auto& l : pre.live) {
         l.done = 0;
@@ -660,6 +664,20 @@ void Images::preload(const std::vector<std::string>& urls)
     if (pre_urls.empty())
         return;
     fs::mkdirs(CACHE);
+    Images* self = this;
+    SceUID th = sceKernelCreateThread("vpkgj_premain", preload_main, 186, 256 * 1024, 0, SCE_KERNEL_CPU_MASK_USER_1, nullptr);
+    if (th >= 0) {
+        pre.running++;
+        {
+            std::lock_guard<Mutex> lock(pre_m);
+            pre_threads.push_back(th);
+        }
+        sceKernelStartThread(th, sizeof(self), &self);
+    }
+}
+
+void Images::spawn_workers()
+{
     for (int i = 0; i < 3; i++) {
         struct Arg {
             Images* self;
@@ -668,10 +686,93 @@ void Images::preload(const std::vector<std::string>& urls)
         SceUID th = sceKernelCreateThread("vpkgj_preload", preload_worker, 186, 256 * 1024, 0, i == 1 ? SCE_KERNEL_CPU_MASK_USER_2 : SCE_KERNEL_CPU_MASK_USER_1, nullptr);
         if (th >= 0) {
             pre.running++;
+            {
+                std::lock_guard<Mutex> lock(pre_m);
+                pre_threads.push_back(th);
+            }
             sceKernelStartThread(th, sizeof(arg), &arg);
-            pre_threads.push_back(th);
         }
     }
+}
+
+bool Images::unpack(const std::string& zip)
+{
+    unzFile z = unzOpen64(zip.c_str());
+    if (!z)
+        return false;
+    unz_global_info64 gi;
+    if (unzGetGlobalInfo64(z, &gi) == UNZ_OK)
+        pre.unpack_total = (int)gi.number_entry;
+    std::vector<uint8_t> buf;
+    int r = unzGoToFirstFile(z);
+    while (r == UNZ_OK && !pre.cancel && !quit) {
+        char name[512];
+        unz_file_info64 info;
+        if (unzGetCurrentFileInfo64(z, &info, name, sizeof(name), nullptr, 0, nullptr, 0) == UNZ_OK) {
+            std::string n = name;
+            if (!n.empty() && n.back() != '/' && info.uncompressed_size > 0 && info.uncompressed_size < 16u * 1024 * 1024) {
+                std::string path = disk_path(pre_media + n);
+                if (!fs::exists(path) && unzOpenCurrentFile(z) == UNZ_OK) {
+                    buf.resize((size_t)info.uncompressed_size);
+                    int got = unzReadCurrentFile(z, buf.data(), (unsigned)buf.size());
+                    unzCloseCurrentFile(z);
+                    if (got == (int)buf.size()) {
+                        std::string tmp = path + ".unz";
+                        if (fs::write(tmp, buf.data(), buf.size()) && sceIoRename(tmp.c_str(), path.c_str()) < 0)
+                            sceIoRemove(tmp.c_str());
+                    }
+                }
+            }
+        }
+        pre.unpacked++;
+        r = unzGoToNextFile(z);
+    }
+    unzClose(z);
+    return true;
+}
+
+int Images::preload_main(unsigned int, void* arg)
+{
+    Images* self = *(Images**)arg;
+    Preload& p = self->pre;
+    int missing = 0;
+    {
+        std::vector<std::string> urls;
+        {
+            std::lock_guard<Mutex> lock(self->pre_m);
+            urls = self->pre_urls;
+        }
+        for (auto& u : urls) {
+            if (p.cancel)
+                break;
+            if (!fs::exists(disk_path(u)))
+                missing++;
+        }
+    }
+    if (missing > 40 && !self->pre_media.empty() && !p.cancel && !self->quit) {
+        p.stage = 1;
+        std::string zip = APP_DIR + "/dl/media_pack.zip";
+        fs::mkdirs(APP_DIR + "/dl");
+        net::Session session;
+        session.buffer = 256 * 1024;
+        std::string err;
+        bool ok = net::fetch(self->pre_media + "pack.zip", zip, &p.live[0], err, &session);
+        if (!ok && !p.cancel)
+            log_line("media pack: %s", err.c_str());
+        p.live[0].done = 0;
+        p.live[0].total = 0;
+        if (ok && !p.cancel) {
+            p.stage = 2;
+            self->unpack(zip);
+        }
+        sceIoRemove(zip.c_str());
+        sceIoRemove((zip + ".part").c_str());
+    }
+    p.stage = 3;
+    if (!p.cancel && !self->quit)
+        self->spawn_workers();
+    p.running--;
+    return sceKernelExitDeleteThread(0);
 }
 
 void Images::preload_stop()
@@ -679,11 +780,19 @@ void Images::preload_stop()
     pre.cancel = true;
     for (auto& l : pre.live)
         l.cancel = true;
-    for (auto th : pre_threads) {
-        SceUInt timeout = 5 * 1000 * 1000;
-        sceKernelWaitThreadEnd(th, nullptr, &timeout);
+    for (;;) {
+        std::vector<int> ths;
+        {
+            std::lock_guard<Mutex> lock(pre_m);
+            ths.swap(pre_threads);
+        }
+        if (ths.empty())
+            break;
+        for (auto th : ths) {
+            SceUInt timeout = 5 * 1000 * 1000;
+            sceKernelWaitThreadEnd(th, nullptr, &timeout);
+        }
     }
-    pre_threads.clear();
 }
 
 int Images::preload_worker(unsigned int, void* arg)
