@@ -6,17 +6,18 @@
 #include <vector>
 
 namespace col {
-constexpr unsigned BG = RGBA8(13, 14, 18, 255);
-constexpr unsigned SURFACE = RGBA8(24, 26, 33, 255);
-constexpr unsigned SURFACE2 = RGBA8(36, 39, 49, 255);
-constexpr unsigned LINE = RGBA8(48, 52, 64, 255);
-constexpr unsigned TEXT = RGBA8(242, 243, 247, 255);
-constexpr unsigned MUTED = RGBA8(140, 146, 160, 255);
-constexpr unsigned ACCENT = RGBA8(76, 141, 255, 255);
-constexpr unsigned ACCENT_DIM = RGBA8(76, 141, 255, 60);
-constexpr unsigned GREEN = RGBA8(52, 199, 140, 255);
-constexpr unsigned ORANGE = RGBA8(255, 159, 67, 255);
-constexpr unsigned RED = RGBA8(255, 99, 99, 255);
+constexpr unsigned BG = RGBA8(14, 12, 24, 255);
+constexpr unsigned SURFACE = RGBA8(27, 24, 42, 255);
+constexpr unsigned SURFACE2 = RGBA8(41, 36, 62, 255);
+constexpr unsigned LINE = RGBA8(56, 50, 82, 255);
+constexpr unsigned TEXT = RGBA8(244, 242, 252, 255);
+constexpr unsigned MUTED = RGBA8(150, 144, 176, 255);
+constexpr unsigned ACCENT = RGBA8(139, 92, 246, 255);
+constexpr unsigned ACCENT2 = RGBA8(244, 114, 182, 255);
+constexpr unsigned ACCENT_DIM = RGBA8(139, 92, 246, 60);
+constexpr unsigned GREEN = RGBA8(52, 211, 153, 255);
+constexpr unsigned ORANGE = RGBA8(251, 170, 80, 255);
+constexpr unsigned RED = RGBA8(248, 113, 113, 255);
 }
 
 enum Btn { BTN_CROSS, BTN_CIRCLE, BTN_TRIANGLE, BTN_SQUARE, BTN_L, BTN_R, BTN_START, BTN_SELECT };
@@ -57,5 +58,7 @@ void placeholder_round(float x, float y, float w, float h, float r, const std::s
 void button(Btn b, float x, float y, float size);
 float hint(float x, float y, Btn b, const std::string& label);
 void spinner(float x, float y, float r, unsigned c);
+void mascot(float x, float y, float size, float a);
+void logo(float x, float y, float size);
 
 }

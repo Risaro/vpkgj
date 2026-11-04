@@ -13,6 +13,8 @@ static std::string font_data[2];
 static std::map<int, vita2d_font*> fonts;
 
 static vita2d_texture* bg_tex = nullptr;
+static vita2d_texture* mascot_tex = nullptr;
+static vita2d_texture* logo_tex = nullptr;
 
 static void make_background()
 {
@@ -25,13 +27,13 @@ static void make_background()
     struct Glow {
         float x, y, r, cr, cg, cb, a;
     } glows[] = {
-        {60, -20, 260, 76, 141, 255, 0.22f},
-        {470, 290, 300, 150, 90, 255, 0.16f},
-        {300, 120, 200, 40, 200, 180, 0.05f},
+        {40, -30, 280, 139, 92, 246, 0.26f},
+        {490, 300, 320, 244, 114, 182, 0.13f},
+        {300, 130, 220, 90, 70, 200, 0.06f},
     };
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            float r = 13, g = 14, b = 18;
+            float r = 14, g = 12, b = 24;
             for (auto& gl : glows) {
                 float dx = x - gl.x, dy = y - gl.y;
                 float d = sqrtf(dx * dx + dy * dy) / gl.r;
@@ -124,9 +126,32 @@ void placeholder(float x, float y, float w, float h, const std::string& name, in
         text_center(bold, x + w / 2, y + h / 2 + size * 0.36f, size, RGBA8(255, 255, 255, 220), initials(name));
 }
 
+void mascot(float x, float y, float size, float a)
+{
+    if (!mascot_tex)
+        return;
+    float w = vita2d_texture_get_width(mascot_tex), h = vita2d_texture_get_height(mascot_tex);
+    float s = size / std::max(w, h);
+    vita2d_draw_texture_tint_scale(mascot_tex, x + (size - w * s) / 2, y + (size - h * s) / 2, s, s, RGBA8(255, 255, 255, (int)(255 * a)));
+}
+
+void logo(float x, float y, float size)
+{
+    if (!logo_tex)
+        return;
+    float s = size / vita2d_texture_get_width(logo_tex);
+    vita2d_draw_texture_scale(logo_tex, x, y, s, s);
+}
+
 bool init()
 {
     make_background();
+    mascot_tex = vita2d_load_PNG_file("app0:assets/mascot.png");
+    logo_tex = vita2d_load_PNG_file("app0:assets/logo.png");
+    if (mascot_tex)
+        vita2d_texture_set_filters(mascot_tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
+    if (logo_tex)
+        vita2d_texture_set_filters(logo_tex, SCE_GXM_TEXTURE_FILTER_LINEAR, SCE_GXM_TEXTURE_FILTER_LINEAR);
     fs::read("app0:assets/Inter-Regular.ttf", font_data[regular]);
     fs::read("app0:assets/Inter-SemiBold.ttf", font_data[bold]);
     if (font_data[bold].empty())

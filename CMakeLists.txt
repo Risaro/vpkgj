@@ -13,7 +13,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "VPKGJ")
 set(VITA_TITLEID "VPKG00001")
-set(VITA_VERSION "01.00")
+set(VITA_VERSION "01.10")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -117,6 +117,8 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
        sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
        assets/Inter-Regular.ttf assets/Inter-Regular.ttf
        assets/Inter-SemiBold.ttf assets/Inter-SemiBold.ttf
+       assets/mascot.png assets/mascot.png
+       assets/logo.png assets/logo.png
        ${CMAKE_BINARY_DIR}/vpkgj_daemon.suprx vpkgj_daemon.suprx
 )
 
