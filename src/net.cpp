@@ -102,7 +102,13 @@ struct Ctx {
     uint64_t offset = 0;
     std::function<bool(const uint8_t*, size_t)> sink;
     bool failed = false;
+    bool plain = false;
 };
+
+static bool tls_refused(CURLcode rc)
+{
+    return rc == CURLE_SSL_CONNECT_ERROR || rc == CURLE_SSL_CIPHER;
+}
 
 static size_t on_write(char* ptr, size_t size, size_t n, void* ud)
 {
@@ -153,6 +159,10 @@ static CURL* make(const std::string& url, Ctx& ctx, Session* s = nullptr)
     curl_easy_setopt(h, CURLOPT_MAXREDIRS, 10L);
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
+    if (!ctx.plain) {
+        curl_easy_setopt(h, CURLOPT_SSL_CIPHER_LIST, "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-CHACHA20-POLY1305");
+        curl_easy_setopt(h, CURLOPT_TLS13_CIPHERS, "TLS_CHACHA20_POLY1305_SHA256");
+    }
     curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, 20L);
     curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME, 60L);
@@ -251,8 +261,10 @@ static void release(CURL* h, Session* s)
 bool get(const std::string& url, std::string& out, std::string& err, Session* s)
 {
     std::string target = url;
+    bool plain = false;
     for (int attempt = 0; attempt < 2; attempt++) {
         Ctx ctx;
+        ctx.plain = plain;
         out.clear();
         ctx.sink = [&](const uint8_t* d, size_t n) {
             out.append((const char*)d, n);
@@ -261,6 +273,12 @@ bool get(const std::string& url, std::string& out, std::string& err, Session* s)
         CURL* h = make(target, ctx, s);
         CURLcode rc = curl_easy_perform(h);
         bool html = is_html(h);
+        if (rc != CURLE_OK && tls_refused(rc) && !plain && starts_with(target, "https://")) {
+            release(h, s);
+            plain = true;
+            attempt--;
+            continue;
+        }
         if (rc != CURLE_OK) {
             err = curl_err(h, rc);
             release(h, s);
@@ -351,9 +369,11 @@ bool fetch(const std::string& url, const std::string& path, Progress* p, std::st
     fs::mkdirs(fs::parent(path));
     std::string target = url;
     Writer out(s ? 128 * 1024 : 1024 * 1024);
+    bool plain = false;
     for (int attempt = 0; attempt < 3; attempt++) {
         int64_t have = fs::size(part);
         Ctx ctx;
+        ctx.plain = plain;
         ctx.progress = p;
         ctx.offset = have > 0 ? (uint64_t)have : 0;
         if (!out.open(part, ctx.offset != 0)) {
@@ -385,6 +405,12 @@ bool fetch(const std::string& url, const std::string& path, Progress* p, std::st
         bool wrote = out.close();
         if (rc == CURLE_OK && !wrote)
             rc = CURLE_WRITE_ERROR;
+        if (rc != CURLE_OK && tls_refused(rc) && !plain && starts_with(target, "https://")) {
+            release(h, s);
+            plain = true;
+            attempt--;
+            continue;
+        }
         if (rc != CURLE_OK) {
             if (code == 416 && ctx.offset) {
                 release(h, s);
