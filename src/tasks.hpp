@@ -24,6 +24,7 @@ struct Task {
     uint64_t sample_bytes = 0;
     double speed = 0;
     bool reboot = false;
+    bool restart = false;
     bool notified = false;
     bool synced = false;
 
@@ -54,6 +55,8 @@ private:
 };
 
 std::string tai_dir();
+std::string bg_file(const std::string& url);
+std::string first_link(const std::string& primary);
 bool plugin_present(const Entry& plugin);
 bool tai_add_plugin(const std::string& section, const std::string& path, std::string& err);
 bool tai_remove_plugin(const std::string& path);

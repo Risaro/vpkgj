@@ -13,7 +13,8 @@
 
 #define DIR "ux0:data/VPKGJ"
 #define INDEX_MAX (768 * 1024)
-#define CHUNK (64 * 1024)
+#define CHUNK (128 * 1024)
+#define QUEUE_MAX (16 * 1024)
 #define NET_SIZE (141 * 1024)
 #define APP_ID "VPKG00001"
 
@@ -32,6 +33,8 @@ static char* versions;
 static char* notified;
 static char* fresh;
 static char* queue_buf;
+static char* bgq;
+static char* bgadd;
 static int fresh_len;
 static int found;
 static char first_name[96];
@@ -125,6 +128,8 @@ static int http_get(const char* url, Sink sink)
     int tpl = sceHttpCreateTemplate("VPKGJ-daemon/1.0", SCE_HTTP_VERSION_1_1, 1);
     if (tpl < 0)
         return 0;
+    sceHttpSetConnectTimeOut(tpl, 20 * 1000 * 1000);
+    sceHttpSetRecvTimeOut(tpl, 60 * 1000 * 1000);
     int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
     if (conn >= 0) {
         int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0);
@@ -351,6 +356,261 @@ static void check(void)
     notify(text);
 }
 
+
+static int online(void)
+{
+    int state = 0;
+    return sceNetCtlInetGetState(&state) >= 0 && state == SCE_NETCTL_STATE_CONNECTED;
+}
+
+static void hash_name(const char* s, char* out)
+{
+    unsigned long long h = 1469598103934665603ull;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ull;
+    }
+    static const char* hex = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) {
+        out[i] = hex[h & 15];
+        h >>= 4;
+    }
+    out[16] = 0;
+}
+
+static int exists(const char* path)
+{
+    SceIoStat st;
+    return sceIoGetstat(path, &st) >= 0;
+}
+
+static long long file_size(const char* path)
+{
+    SceIoStat st;
+    if (sceIoGetstat(path, &st) < 0)
+        return -1;
+    return st.st_size;
+}
+
+static void write_file(const char* path, const char* text, int len)
+{
+    SceUID f = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
+    if (f >= 0) {
+        if (len > 0)
+            sceIoWrite(f, text, len);
+        sceIoClose(f);
+    }
+}
+
+static void drain_queue(void);
+
+static char cur_key[128];
+static char cur_name[96];
+static unsigned long long state_at;
+
+static void save_state(unsigned long long done, unsigned long long total)
+{
+    char text[320];
+    int n = sceClibSnprintf(text, sizeof(text), "%s\t%s\t%u\t%u\n", cur_key, cur_name, (unsigned)(done / 1024), (unsigned)(total / 1024));
+    write_file(DIR "/bgstate.txt", text, n);
+}
+
+static int stop_requested(void)
+{
+    return exists(DIR "/bgq.stop") || exists(DIR "/daemon_off");
+}
+
+static int download(const char* url, const char* path)
+{
+    char part[200];
+    sceClibSnprintf(part, sizeof(part), "%s.part", path);
+    long long have = file_size(part);
+    if (have < 0)
+        have = 0;
+    int ok = 0;
+    int tpl = sceHttpCreateTemplate("VPKGJ-daemon/1.0", SCE_HTTP_VERSION_1_1, 1);
+    if (tpl < 0)
+        return 0;
+    sceHttpSetConnectTimeOut(tpl, 20 * 1000 * 1000);
+    sceHttpSetRecvTimeOut(tpl, 60 * 1000 * 1000);
+    sceHttpSetAutoRedirect(tpl, 1);
+    int conn = sceHttpCreateConnectionWithURL(tpl, url, 1);
+    if (conn >= 0) {
+        int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0);
+        if (req >= 0) {
+            if (have > 0) {
+                char range[48];
+                sceClibSnprintf(range, sizeof(range), "bytes=%u-", (unsigned)have);
+                sceHttpAddRequestHeader(req, "Range", range, SCE_HTTP_HEADER_ADD);
+            }
+            int status = 0;
+            if (sceHttpSendRequest(req, 0, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0 && (status == 200 || status == 206)) {
+                unsigned long long len = 0;
+                if (sceHttpGetResponseContentLength(req, &len) < 0)
+                    len = 0;
+                if (status == 200)
+                    have = 0;
+                unsigned long long total = len ? have + len : 0;
+                SceUID f = sceIoOpen(part, SCE_O_WRONLY | SCE_O_CREAT | (have ? SCE_O_APPEND : SCE_O_TRUNC), 0777);
+                if (f >= 0) {
+                    unsigned long long done = have;
+                    ok = 1;
+                    for (;;) {
+                        int n = sceHttpReadData(req, chunk, CHUNK);
+                        if (n < 0)
+                            ok = 0;
+                        if (n <= 0)
+                            break;
+                        if (sceIoWrite(f, chunk, n) != n) {
+                            ok = 0;
+                            break;
+                        }
+                        done += n;
+                        if (done - state_at >= 2 * 1024 * 1024) {
+                            state_at = done;
+                            save_state(done, total);
+                            drain_queue();
+                            if (stop_requested()) {
+                                ok = 0;
+                                break;
+                            }
+                        }
+                    }
+                    sceIoClose(f);
+                    if (ok && total && done < total)
+                        ok = 0;
+                }
+            } else if (status == 416) {
+                sceIoRemove(part);
+            }
+            sceHttpDeleteRequest(req);
+        }
+        sceHttpDeleteConnection(conn);
+    }
+    sceHttpDeleteTemplate(tpl);
+    if (ok) {
+        sceIoRemove(path);
+        ok = sceIoRename(part, path) >= 0;
+    }
+    return ok;
+}
+
+static void merge_added(void)
+{
+    if (!exists(DIR "/bgq.add"))
+        return;
+    sceIoRemove(DIR "/bgq.in");
+    if (sceIoRename(DIR "/bgq.add", DIR "/bgq.in") < 0)
+        return;
+    int n = read_file(DIR "/bgq.in", bgadd, QUEUE_MAX);
+    sceIoRemove(DIR "/bgq.in");
+    if (n > 0)
+        append_file(DIR "/bgq.txt", bgadd, n);
+}
+
+static int fails;
+static unsigned long long retry_at;
+
+static unsigned long long now_s(void)
+{
+    return sceKernelGetSystemTimeWide() / 1000000ull;
+}
+
+static void field(const char** p, char* out, int max)
+{
+    int i = 0;
+    while (**p && **p != '\t' && **p != '\n' && **p != '\r') {
+        if (i < max - 1)
+            out[i++] = **p;
+        (*p)++;
+    }
+    out[i] = 0;
+    if (**p == '\t')
+        (*p)++;
+}
+
+static void drop_first(int keep_key_done)
+{
+    int n = read_file(DIR "/bgq.txt", bgq, QUEUE_MAX);
+    char* nl = bgq;
+    while (*nl && *nl != '\n')
+        nl++;
+    if (*nl)
+        nl++;
+    int rest = n - (int)(nl - bgq);
+    if (rest <= 0)
+        sceIoRemove(DIR "/bgq.txt");
+    else
+        write_file(DIR "/bgq.txt", nl, rest);
+    if (!keep_key_done)
+        return;
+    char pat[140];
+    sceClibSnprintf(pat, sizeof(pat), "%s\t", cur_key);
+    if (rest > 0 && sceClibStrstr(nl, pat))
+        return;
+    char line[160];
+    int l = sceClibSnprintf(line, sizeof(line), "%s\n", cur_key);
+    append_file(DIR "/bgdone.txt", line, l);
+    char text[200];
+    sceClibSnprintf(text, sizeof(text), "Скачано в фоне: %s. Открой VPKGJ, чтобы установить", cur_name);
+    notify(text);
+}
+
+static int process_queue(void)
+{
+    if (exists(DIR "/bgq.stop")) {
+        sceIoRemove(DIR "/bgq.txt");
+        sceIoRemove(DIR "/bgq.add");
+        sceIoRemove(DIR "/bgq.stop");
+        sceIoRemove(DIR "/bgstate.txt");
+        fails = 0;
+        return 0;
+    }
+    merge_added();
+    if (read_file(DIR "/bgq.txt", bgq, QUEUE_MAX) <= 0) {
+        sceIoRemove(DIR "/bgstate.txt");
+        return 0;
+    }
+    if (now_s() < retry_at || !online())
+        return 0;
+    const char* p = bgq;
+    char url[1024], hash[17], path[160];
+    field(&p, cur_key, sizeof(cur_key));
+    field(&p, cur_name, sizeof(cur_name));
+    field(&p, url, sizeof(url));
+    if (!cur_key[0] || !url[0]) {
+        drop_first(0);
+        return 1;
+    }
+    hash_name(url, hash);
+    sceClibSnprintf(path, sizeof(path), DIR "/bg/%s", hash);
+    sceIoMkdir(DIR "/bg", 0777);
+    state_at = 0;
+    long long have = file_size(path);
+    if (have < 0) {
+        save_state(0, 0);
+        if (!download(url, path)) {
+            if (stop_requested())
+                return 0;
+            fails++;
+            if (fails >= 6) {
+                char text[200];
+                sceClibSnprintf(text, sizeof(text), "Не удалось скачать в фоне: %s", cur_name);
+                notify(text);
+                drop_first(0);
+                fails = 0;
+            } else {
+                retry_at = now_s() + fails * 30;
+            }
+            return 0;
+        }
+    }
+    fails = 0;
+    drop_first(1);
+    sceIoRemove(DIR "/bgstate.txt");
+    return 1;
+}
+
 static void drain_queue(void)
 {
     SceIoStat st;
@@ -401,17 +661,23 @@ static int daemon_thread(SceSize args, void* argp)
     sceHttpInit(0x40000);
     sceSslInit(0x40000);
     sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY);
-    unsigned ticks = 0;
+    unsigned long long next_check = 0;
     for (;;) {
         SceIoStat st;
         int off = sceIoGetstat(DIR "/daemon_off", &st) >= 0;
-        if (!off && ticks % 4320 == 0)
+        if (!off && now_s() >= next_check && online()) {
             check();
-        if (!off)
+            next_check = now_s() + 6 * 3600;
+        }
+        if (!off) {
             drain_queue();
-        else
+            if (process_queue()) {
+                sceKernelDelayThread(300 * 1000);
+                continue;
+            }
+        } else {
             sceIoRemove(DIR "/notify.txt");
-        ticks++;
+        }
         sceKernelDelayThread(5 * 1000 * 1000);
     }
     return 0;
@@ -442,7 +708,7 @@ int module_start(SceSize argc, const void* args)
     default:
         return SCE_KERNEL_START_FAILED;
     }
-    taipool_init(INDEX_MAX + CHUNK + 2048 + 32 * 1024 * 2 + 64 * 1024 + 16 * 1024 + 4096 + NET_SIZE + 64 * 1024);
+    taipool_init(INDEX_MAX + CHUNK + 2048 + 32 * 1024 * 2 + 64 * 1024 + 16 * 1024 + 4096 + QUEUE_MAX * 2 + NET_SIZE + 64 * 1024);
     index_buf = taipool_alloc(INDEX_MAX);
     chunk = taipool_alloc(CHUNK);
     line = taipool_alloc(2048);
@@ -451,9 +717,11 @@ int module_start(SceSize argc, const void* args)
     notified = taipool_alloc(64 * 1024);
     fresh = taipool_alloc(16 * 1024);
     queue_buf = taipool_alloc(4096);
-    if (!queue_buf || !index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
+    bgq = taipool_alloc(QUEUE_MAX);
+    bgadd = taipool_alloc(QUEUE_MAX);
+    if (!bgq || !bgadd || !queue_buf || !index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
         return SCE_KERNEL_START_FAILED;
-    SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xA0, 0x8000, 0, 0, 0);
+    SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xB0, 0x10000, 0, 0, 0);
     if (th >= 0)
         sceKernelStartThread(th, 0, 0);
     return SCE_KERNEL_START_SUCCESS;

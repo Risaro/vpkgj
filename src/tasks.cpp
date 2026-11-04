@@ -1,12 +1,14 @@
 #include "tasks.hpp"
 
 #include "backup.hpp"
+#include "images.hpp"
 #include "pkg.hpp"
 #include "promote.hpp"
 #include "util.hpp"
 #include "zip.hpp"
 
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 
 #include <algorithm>
@@ -61,11 +63,29 @@ static std::vector<std::string> links(const std::string& primary, const std::str
     return out;
 }
 
+std::string bg_file(const std::string& url)
+{
+    return APP_DIR + "/bg/" + hash_name(url);
+}
+
+std::string first_link(const std::string& primary)
+{
+    auto l = links(primary, "");
+    return l.empty() ? "" : l[0];
+}
+
 static bool download(Task& t, const std::vector<std::string>& urls, const std::string& path, std::string& err)
 {
     if (urls.empty()) {
         err = "Нет ссылки на файл";
         return false;
+    }
+    std::string ready = bg_file(urls[0]);
+    if (fs::exists(ready)) {
+        t.set_stage("Скачано в фоне");
+        sceIoRemove(path.c_str());
+        if (sceIoRename(ready.c_str(), path.c_str()) >= 0)
+            return true;
     }
     for (size_t i = 0; i < urls.size(); i++) {
         t.set_stage(i ? "Загрузка с зеркала" : "Загрузка");
@@ -413,11 +433,43 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
     return true;
 }
 
+static bool self_update(Task& t, const std::string& file, std::string& err)
+{
+    t.set_stage("Обновление VPKGJ");
+    images_close_pak();
+    std::string dir = "ux0:app/VPKG00001";
+    bool ok = zip_extract(file, dir, &t.progress, err, [&](const std::string& n) {
+        std::string l = lower(n);
+        if (starts_with(l, "sce_sys/package/"))
+            return std::string();
+        return dir + "/" + n;
+    });
+    if (!ok)
+        return false;
+    std::lock_guard<std::mutex> lock(t.m);
+    t.restart = true;
+    t.note = "Перезапусти VPKGJ, чтобы включилась новая версия";
+    return true;
+}
+
 void Tasks::run(Task& t)
 {
     const Entry& e = t.entry;
     std::string err;
     std::string dl = APP_DIR + "/dl/" + std::string(category_key(e.cat)) + "_" + hash_name(e.id + e.url);
+    if (e.install == "self") {
+        bool ok = download(t, links(e.url, e.mirror), dl, err) && self_update(t, dl, err);
+        sceIoRemove(dl.c_str());
+        if (ok) {
+            t.set_stage("Готово");
+            t.state = TS_DONE;
+        } else {
+            std::lock_guard<std::mutex> lock(t.m);
+            t.error = t.progress.cancel ? "Отменено" : err;
+            t.state = t.progress.cancel ? TS_CANCELED : TS_FAILED;
+        }
+        return;
+    }
     bool ok = false;
     bool deps_missing = false;
     for (auto& d : t.deps)
@@ -542,7 +594,8 @@ void Tasks::start(Installed* inst)
     installed = inst;
     fs::mkdirs(APP_DIR + "/dl");
     fs::mkdirs(TEMP);
-    thread = sceKernelCreateThread("vpkgj_tasks", worker, 0x10000100, 256 * 1024, 0, 0, nullptr);
+    fs::mkdirs(APP_DIR + "/bg");
+    thread = sceKernelCreateThread("vpkgj_tasks", worker, 172, 256 * 1024, 0, SCE_KERNEL_CPU_MASK_USER_1, nullptr);
     Tasks* self = this;
     sceKernelStartThread(thread, sizeof(self), &self);
 }
