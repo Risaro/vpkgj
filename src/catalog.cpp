@@ -310,6 +310,8 @@ void Catalog::apply_covers()
                     e.shots.push_back(s.asString());
         if (e.description.empty())
             e.description = str(v, "d");
+        if (e.lang.empty())
+            e.lang = str(v, "l");
     }
 }
 
@@ -523,6 +525,8 @@ Status Installed::status(const Entry& e)
     }
     if (!recorded)
         return detect(e) ? ST_INSTALLED : ST_NONE;
+    if (e.cat == CAT_PLUGINS && e.id == "vpkgj_daemon")
+        return version_cmp(it->second, e.version) < 0 ? ST_UPDATE : ST_INSTALLED;
     if (it->second != (e.version.empty() ? "-" : e.version) && it->second != e.alt_version)
         return ST_UPDATE;
     return ST_INSTALLED;

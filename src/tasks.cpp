@@ -8,6 +8,7 @@
 #include "zip.hpp"
 
 #include <psp2/io/fcntl.h>
+#include <cstring>
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 
@@ -106,10 +107,12 @@ static bool is_zip(const std::string& path)
     SceUID f = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
     if (f < 0)
         return false;
-    char b[2] = {0, 0};
-    sceIoRead(f, b, 2);
+    char b[264] = {0};
+    int r = sceIoRead(f, b, sizeof(b));
     sceIoClose(f);
-    return b[0] == 'P' && b[1] == 'K';
+    if (r >= 2 && b[0] == 'P' && b[1] == 'K')
+        return true;
+    return r >= 262 && memcmp(b + 257, "ustar", 5) == 0;
 }
 
 static bool tai_add(const std::string& section, const std::string& plugin, std::string& err)
@@ -230,6 +233,19 @@ static bool install_plugin_files(Task& t, const Entry& pe, const std::string& fi
         });
         if (!ok)
             return false;
+    } else if (pe.id == "vpkgj_daemon") {
+        std::string out = APP_DIR + "/vpkgj_daemon.suprx";
+        fs::mkdirs(APP_DIR);
+        sceIoRemove(out.c_str());
+        if (sceIoRename(file.c_str(), out.c_str()) < 0) {
+            std::string data;
+            if (!fs::read(file, data) || !fs::write(out, data)) {
+                err = "Не удалось скопировать демон";
+                return false;
+            }
+        }
+        sceIoRemove((APP_DIR + "/daemon_off").c_str());
+        placed.push_back(out);
     } else {
         std::string name = base_name(split(pe.url, '|').empty() ? pe.url : split(pe.url, '|')[0]);
         size_t q = name.find('?');
@@ -433,11 +449,17 @@ static bool install_translation(Task& t, const std::string& file, std::string& e
     return true;
 }
 
-static bool self_update(Task& t, const std::string& file, std::string& err)
+static bool self_update(Task& t, const std::string& file, bool staged, std::string& err)
 {
-    t.set_stage("Обновление VPKGJ");
-    images_close_pak();
-    std::string dir = "ux0:app/VPKG00001";
+    t.set_stage(staged ? "Подготовка обновления" : "Обновление VPKGJ");
+    std::string dir = staged ? APP_DIR + "/update" : "ux0:app/VPKG00001";
+    if (staged) {
+        fs::rmtree(dir);
+        sceIoRemove((APP_DIR + "/update.ready").c_str());
+        fs::mkdirs(dir);
+    } else {
+        images_close_pak();
+    }
     bool ok = zip_extract(file, dir, &t.progress, err, [&](const std::string& n) {
         std::string l = lower(n);
         if (starts_with(l, "sce_sys/package/"))
@@ -446,9 +468,14 @@ static bool self_update(Task& t, const std::string& file, std::string& err)
     });
     if (!ok)
         return false;
+    if (staged && !fs::exists(dir + "/eboot.bin")) {
+        err = "В обновлении нет eboot.bin";
+        return false;
+    }
     std::lock_guard<Mutex> lock(t.m);
     t.restart = true;
-    t.note = "Перезапусти VPKGJ, чтобы включилась новая версия";
+    t.staged = staged;
+    t.note = staged ? "VPKGJ закроется, обновится и запустится сам" : "Перезапусти VPKGJ, чтобы включилась новая версия";
     return true;
 }
 
@@ -457,8 +484,8 @@ void Tasks::run(Task& t)
     const Entry& e = t.entry;
     std::string err;
     std::string dl = APP_DIR + "/dl/" + std::string(category_key(e.cat)) + "_" + hash_name(e.id + e.url);
-    if (e.install == "self") {
-        bool ok = download(t, links(e.url, e.mirror), dl, err) && self_update(t, dl, err);
+    if (e.install == "self" || e.install == "self_daemon") {
+        bool ok = download(t, links(e.url, e.mirror), dl, err) && self_update(t, dl, e.install == "self_daemon", err);
         sceIoRemove(dl.c_str());
         if (ok) {
             t.set_stage("Готово");

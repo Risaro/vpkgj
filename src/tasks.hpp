@@ -26,6 +26,7 @@ struct Task {
     double speed = 0;
     bool reboot = false;
     bool restart = false;
+    bool staged = false;
     bool notified = false;
     bool synced = false;
 

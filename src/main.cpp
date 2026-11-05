@@ -36,7 +36,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.3"
+#define VPKGJ_VERSION "1.5"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -127,6 +127,11 @@ struct App {
     void daemon_notify(const std::string& text);
     void toggle_daemon();
     int daemon_state = -1;
+    bool daemon_alive();
+    bool daemon_from_app();
+    void daemon_autoupdate();
+    bool daemon_update_tried = false;
+    void daemon_repair(bool from_settings);
     int dl_sel = 0;
 
     float fx = 0, fy = 0, fw = 0, fh = 0;
@@ -166,6 +171,13 @@ struct App {
     void apply_speed();
     std::string bg_name;
     uint64_t bg_done = 0, bg_total = 0;
+    struct BgItem {
+        std::string key, name;
+        int files = 0;
+    };
+    std::vector<BgItem> bg_items;
+    std::string bg_key;
+    uint64_t bg_speed = 0, bg_prev_done = 0, bg_prev_ms = 0;
     int bg_left = 0;
     uint64_t bg_polled = 0;
     void poll_bg();
@@ -1001,6 +1013,7 @@ void App::apply_refresh()
         rebuild();
         if (!app_prompted)
             ask_app_update(false);
+        daemon_autoupdate();
         notify_updates();
         if (!pre_checked) {
             pre_checked = true;
@@ -1662,7 +1675,7 @@ void App::draw_header()
         std::string label = t == TAB_DOWNLOADS ? "Загрузки" : t == TAB_UPDATES ? "Обновления" : category_title((Category)t);
         if (!query.empty() && t < CAT_COUNT)
             label += " " + std::to_string(filtered[t].size());
-        int n = t == TAB_DOWNLOADS ? tasks.active() : t == TAB_UPDATES ? updates_count : 0;
+        int n = t == TAB_DOWNLOADS ? tasks.active() + (int)bg_items.size() : t == TAB_UPDATES ? updates_count : 0;
         int tw = gfx::width(gfx::bold, 15, label);
         float w = tw + 28 + (n ? 26 : 0);
         bool on = t == tab;
@@ -2133,8 +2146,7 @@ void App::toggle_daemon()
         show_toast("Фоновая проверка выключена");
         return;
     }
-    std::string data;
-    if (!fs::read("app0:vpkgj_daemon.suprx", data) || !fs::write(DAEMON_PATH, data)) {
+    if (!fs::exists(DAEMON_PATH) && !daemon_from_app()) {
         show_toast("Не удалось скопировать демон");
         return;
     }
@@ -2200,18 +2212,51 @@ void App::poll_bg()
     fs::read(APP_DIR + "/bgq.txt", q);
     fs::read(APP_DIR + "/bgq.add", add);
     bg_left = count_lines(q) + count_lines(add);
+    bg_items.clear();
+    {
+        std::string all = q + add;
+        size_t pos = 0;
+        while (pos < all.size()) {
+            size_t n = all.find('\n', pos);
+            std::string l = all.substr(pos, n == std::string::npos ? std::string::npos : n - pos);
+            pos = n == std::string::npos ? all.size() : n + 1;
+            size_t a = l.find('\t');
+            if (a == std::string::npos)
+                continue;
+            size_t b = l.find('\t', a + 1);
+            std::string k = l.substr(0, a), nm = l.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1);
+            if (!bg_items.empty() && bg_items.back().key == k)
+                bg_items.back().files++;
+            else
+                bg_items.push_back({k, nm, 1});
+        }
+    }
     bg_name.clear();
+    std::string prev_key = bg_key;
+    bg_key.clear();
     bg_done = bg_total = 0;
     if (bg_left && fs::read(APP_DIR + "/bgstate.txt", st)) {
         size_t a = st.find('\t');
         size_t b = a == std::string::npos ? a : st.find('\t', a + 1);
         if (b != std::string::npos) {
             unsigned d = 0, t = 0;
+            bg_key = st.substr(0, a);
             bg_name = st.substr(a + 1, b - a - 1);
             sscanf(st.c_str() + b + 1, "%u\t%u", &d, &t);
             bg_done = (uint64_t)d * 1024;
             bg_total = (uint64_t)t * 1024;
         }
+    }
+    uint64_t ms = now_ms();
+    if (bg_key.empty() || bg_key != prev_key || bg_done < bg_prev_done) {
+        bg_speed = 0;
+    } else if (bg_done > bg_prev_done && ms > bg_prev_ms) {
+        uint64_t inst = (bg_done - bg_prev_done) * 1000 / (ms - bg_prev_ms);
+        bg_speed = bg_speed ? (bg_speed * 2 + inst) / 3 : inst;
+    }
+    if (bg_key.empty() || bg_key != prev_key || bg_done != bg_prev_done) {
+        bg_prev_done = bg_done;
+        bg_prev_ms = ms;
     }
     std::string done;
     if (!fs::read(APP_DIR + "/bgdone.txt", done) || done.empty())
@@ -2249,6 +2294,129 @@ void App::poll_bg()
         show_toast("Скачано в фоне, ставлю: " + std::to_string(added));
 }
 
+static uint64_t uptime_s()
+{
+    return sceKernelGetSystemTimeWide() / 1000000ULL;
+}
+
+static uint64_t boot_mark()
+{
+    uint64_t now = (uint64_t)time(nullptr), up = uptime_s();
+    return now > up ? now - up : 0;
+}
+
+bool App::daemon_from_app()
+{
+    std::string a;
+    if (!fs::read("app0:vpkgj_daemon.suprx", a) || a.empty())
+        return false;
+    fs::mkdirs(APP_DIR);
+    if (!fs::write(DAEMON_PATH, a))
+        return false;
+    Entry d;
+    d.cat = CAT_PLUGINS;
+    d.id = "vpkgj_daemon";
+    d.version = VPKGJ_VERSION;
+    installed.set(d);
+    return true;
+}
+
+void App::daemon_autoupdate()
+{
+    if (daemon_update_tried || !daemon_enabled())
+        return;
+    for (auto& e : catalog.items[CAT_PLUGINS]) {
+        if (e.id != "vpkgj_daemon" || e.url.empty())
+            continue;
+        if (installed.status(e) == ST_UPDATE) {
+            daemon_update_tried = true;
+            log_line("daemon autoupdate to %s", e.version.c_str());
+            tasks.add(e);
+            show_toast("Обновляю фоновую службу до " + e.version);
+        }
+        return;
+    }
+}
+
+bool App::daemon_alive()
+{
+    static uint64_t checked_at = 0;
+    static bool ok = false;
+    uint64_t now = uptime_s();
+    if (checked_at && now - checked_at < 3)
+        return ok;
+    checked_at = now;
+    std::string t;
+    uint64_t v = fs::read(APP_DIR + "/daemon.alive", t) ? strtoull(t.c_str(), nullptr, 10) : 0;
+    ok = v && v <= now + 5 && now - v <= 180;
+    if (ok)
+        sceIoRemove((APP_DIR + "/daemon_repair").c_str());
+    return ok;
+}
+
+void App::daemon_repair(bool from_settings)
+{
+    std::string b, cfg;
+    bool file_ok = fs::read(DAEMON_PATH, b) && b.size() > 1024 && b[0] == 'S' && b[1] == 'C' && b[2] == 'E';
+    std::string active = tai_dir() + "/config.txt";
+    fs::read(active, cfg);
+    bool cfg_ok = lower(cfg).find(lower(DAEMON_PATH)) != std::string::npos;
+    std::string mark;
+    uint64_t fixed_boot = fs::read(APP_DIR + "/daemon_repair", mark) ? strtoull(mark.c_str(), nullptr, 10) : 0;
+    uint64_t boot = boot_mark();
+    bool same_boot = fixed_boot && (fixed_boot > boot ? fixed_boot - boot : boot - fixed_boot) < 30;
+    modal = Modal();
+    modal.on = true;
+    if (!from_settings) {
+        modal.alt = "Поставить сразу";
+        modal.alt_action = [this]() { primary_action(); };
+    }
+    if (file_ok && cfg_ok && fixed_boot && !same_boot) {
+        log_line("daemon dead after repair and reboot");
+        modal.title = "Фоновая служба не стартует";
+        modal.lines.push_back("Файл и строка в " + active + " на месте, перезагрузка была,");
+        modal.lines.push_back("но демон не отвечает. Обычно это прошивка не 3.60/3.65");
+        modal.lines.push_back("или конфликт с другим плагином в секции *main.");
+        modal.yes = "Попробовать ещё раз";
+        modal.action = [this]() {
+            fs::write(APP_DIR + "/daemon_repair", std::to_string(boot_mark()));
+            scePowerRequestColdReset();
+        };
+        return;
+    }
+    std::vector<std::string> fixes;
+    if (!file_ok)
+        fixes.push_back(b.empty() ? "файл демона пропал из ux0:data/VPKGJ" : "файл демона повреждён");
+    if (!cfg_ok)
+        fixes.push_back("демона нет в " + active);
+    if (fixes.empty())
+        fixes.push_back("демон не загружен в эту сессию консоли");
+    modal.title = "Фоновая служба не отвечает";
+    modal.lines.push_back("Нашёл: " + fixes[0] + (fixes.size() > 1 ? ", " + fixes[1] : ""));
+    modal.lines.push_back("Починю сам и перезагружу консоль, после этого фон заработает.");
+    modal.yes = "Починить";
+    modal.action = [this, file_ok, cfg_ok]() {
+        std::string e;
+        backup_create("Перед починкой фоновой службы: config.txt", {"ux0:tai/config.txt", "ur0:tai/config.txt"}, e);
+        if (!file_ok && !daemon_from_app()) {
+            show_toast("Не удалось записать файл демона");
+            return;
+        }
+        sceIoRemove((APP_DIR + "/daemon_off").c_str());
+        if (!cfg_ok && !tai_add_plugin("*main", DAEMON_PATH, e)) {
+            show_toast(e);
+            return;
+        }
+        daemon_state = 1;
+        log_line("daemon repaired file=%d cfg=%d", file_ok ? 1 : 0, cfg_ok ? 1 : 0);
+        fs::write(APP_DIR + "/daemon_repair", std::to_string(boot_mark()));
+        if (tasks.active())
+            show_toast("Починил. Перезагрузи консоль после загрузок");
+        else
+            scePowerRequestColdReset();
+    };
+}
+
 void App::ask_daemon()
 {
     modal = Modal();
@@ -2265,6 +2433,10 @@ void App::queue_background(const Entry& e)
 {
     if (!daemon_enabled()) {
         ask_daemon();
+        return;
+    }
+    if (!daemon_alive()) {
+        daemon_repair(false);
         return;
     }
     std::vector<std::string> urls;
@@ -2327,6 +2499,10 @@ void App::cancel_background()
 {
     fs::write(APP_DIR + "/bgq.stop", "1");
     sceIoRemove((APP_DIR + "/bgq.add").c_str());
+    sceIoRemove((APP_DIR + "/bgq.txt").c_str());
+    sceIoRemove((APP_DIR + "/bgstate.txt").c_str());
+    bg_left = 0;
+    bg_name.clear();
     bg_polled = 0;
     show_toast("Фоновые загрузки остановлены");
 }
@@ -2366,7 +2542,7 @@ void App::ask_app_update(bool manual)
         e.name = "VPKGJ " + catalog.app_version;
         e.version = catalog.app_version;
         e.url = catalog.app_url;
-        e.install = "self";
+        e.install = daemon_enabled() && daemon_alive() ? "self_daemon" : "self";
         tasks.add(e);
         set_tab(TAB_DOWNLOADS);
         screen = SCR_BROWSE;
@@ -2398,6 +2574,29 @@ void App::check_reboot()
                 installed.refresh();
                 refresh_updates();
             }
+        }
+        if (t->state == TS_DONE && t->restart && t->staged && !t->notified) {
+            t->notified = true;
+            std::string ver = t->entry.version;
+            auto apply = [this, ver]() {
+                fs::write(APP_DIR + "/update.ready", ver);
+                log_line("update %s handed to daemon", ver.c_str());
+                tasks.stop();
+                images.stop();
+                promoter_fini();
+                net::fini();
+                sceKernelExitProcess(0);
+            };
+            modal = Modal();
+            modal.on = true;
+            modal.title = "VPKGJ " + ver + " готов";
+            modal.lines.push_back("Приложение закроется, фоновая служба поставит новую версию");
+            modal.lines.push_back("и сама запустит VPKGJ. Это займёт несколько секунд.");
+            if (tasks.active())
+                modal.lines.push_back("Остальные загрузки продолжатся после перезапуска с места остановки.");
+            modal.yes = "Обновить сейчас";
+            modal.action = apply;
+            return;
         }
         if (t->state == TS_DONE && t->restart && !t->notified) {
             t->notified = true;
@@ -2598,23 +2797,60 @@ void App::draw_downloads()
     gfx::text(gfx::regular, 32, y + 12, 14, col::MUTED, "Свободно на ux0: " + fmt_size(free_cached()));
     y += 28;
     if (bg_left) {
-        gfx::rrect(28, y, W - 56, 60, 14, gfx::alpha(col::ACCENT, 0.12f));
-        gfx::rframe(28, y, W - 56, 60, 14, 1, gfx::alpha(col::ACCENT, 0.5f));
-        gfx::spinner(56, y + 30, 9, col::ACCENT);
-        std::string head = "В фоне через демон: файлов " + std::to_string(bg_left);
-        gfx::text(gfx::bold, 80, y + 25, 15, col::TEXT, head);
-        std::string sub = bg_name.empty() ? "Ждёт сеть или своей очереди" : bg_name;
-        if (bg_total)
-            sub += " · " + fmt_size(bg_done) + " из " + fmt_size(bg_total);
-        else if (bg_done)
-            sub += " · " + fmt_size(bg_done);
-        gfx::text(gfx::regular, 80, y + 46, 13, col::MUTED, gfx::ellipsize(gfx::regular, 13, sub, 560));
-        if (bg_total) {
-            float f = (float)bg_done / bg_total;
-            gfx::rrect(W - 46 - 160, y + 26, 160, 6, 3, col::LINE);
-            gfx::rrect(W - 46 - 160, y + 26, std::max(6.0f, 160 * f), 6, 3, col::ACCENT);
+        bool alive = daemon_alive();
+        bool going = !bg_name.empty();
+        gfx::rrect(28, y, W - 56, 84, 14, gfx::alpha(col::ACCENT, 0.12f));
+        gfx::rframe(28, y, W - 56, 84, 14, 1, gfx::alpha(col::ACCENT, 0.5f));
+        gfx::spinner(56, y + 30, 9, alive ? col::ACCENT : col::ORANGE);
+        std::string head = going ? "Качается в фоне: " + bg_name
+                                 : bg_items.empty() ? "В фоне через демон" : "Ждёт в фоне: " + bg_items[0].name;
+        gfx::text(gfx::bold, 80, y + 26, 15, col::TEXT, gfx::ellipsize(gfx::bold, 15, head, 600));
+        std::string sub;
+        if (!alive) {
+            sub = "Фоновая служба не отвечает, почини в настройках";
+        } else if (!going) {
+            sub = "Демон возьмёт её в течение нескольких секунд, если есть сеть";
+        } else {
+            int left = 0;
+            for (auto& it : bg_items)
+                if (it.key == bg_key)
+                    left = it.files;
+            if (bg_total) {
+                sub = std::to_string((int)(bg_done * 100 / bg_total)) + "% · " + fmt_size(bg_done) + " из " + fmt_size(bg_total);
+            } else {
+                sub = fmt_size(bg_done);
+            }
+            if (bg_speed)
+                sub += " · " + fmt_size(bg_speed) + "/с";
+            if (bg_speed && bg_total > bg_done) {
+                uint64_t sec = (bg_total - bg_done) / bg_speed;
+                sub += sec < 60 ? " · ~" + std::to_string(sec) + " с" : " · ~" + std::to_string((sec + 59) / 60) + " мин";
+            }
+            if (left > 1)
+                sub += " · файлов осталось " + std::to_string(left);
         }
-        y += 70;
+        gfx::text(gfx::regular, 80, y + 48, 13, alive ? col::MUTED : col::ORANGE, gfx::ellipsize(gfx::regular, 13, sub, W - 140));
+        float bw = W - 56 - 52 - 28;
+        gfx::rrect(80, y + 62, bw, 6, 3, col::LINE);
+        if (bg_total)
+            gfx::rrect(80, y + 62, std::max(6.0f, bw * (float)bg_done / bg_total), 6, 3, col::ACCENT);
+        y += 94;
+        int shown = 0;
+        for (size_t k = 0; k < bg_items.size() && y < FOOTER_Y - 110; k++) {
+            if (k == 0 && (bg_items[k].key == bg_key || !going))
+                continue;
+            if (bg_items[k].key == bg_key)
+                continue;
+            std::string l = "В очереди: " + bg_items[k].name;
+            if (bg_items[k].files > 1)
+                l += " · файлов " + std::to_string(bg_items[k].files);
+            gfx::rrect(28, y, W - 56, 32, 10, col::SURFACE);
+            gfx::text(gfx::regular, 48, y + 21, 13, col::MUTED, gfx::ellipsize(gfx::regular, 13, l, W - 120));
+            y += 38;
+            shown++;
+        }
+        if (shown)
+            y += 4;
     }
     int first = std::max(0, dl_sel - 4);
     uint64_t now = now_ms();
@@ -2707,7 +2943,12 @@ void App::draw_settings()
              save_prefs();
              apply_speed();
          }},
-        {"Фоновая служба", daemon_enabled() ? "включена" : "выключена", daemon_enabled() ? col::GREEN : col::MUTED, [this]() { toggle_daemon(); }},
+        {"Фоновая служба", !daemon_enabled() ? "выключена" : daemon_alive() ? "работает" : "не отвечает, починить", !daemon_enabled() ? col::MUTED : daemon_alive() ? col::GREEN : col::ORANGE, [this]() {
+             if (daemon_enabled() && !daemon_alive())
+                 daemon_repair(true);
+             else
+                 toggle_daemon();
+         }},
         {"Резервные копии", "config.txt, rePatch, сейвы", col::MUTED, [this]() { open_backups(); }},
         {"Скачать все обложки", "прокрутка без подгрузки", col::MUTED, [this]() { start_preload(); }},
         {"Очистить кеш картинок", "", col::MUTED, [this]() {
@@ -3129,10 +3370,28 @@ void App::run()
     load_prefs();
     apply_speed();
     rebuild();
-    if (fs::exists(DAEMON_PATH)) {
-        std::string a, b;
-        if (fs::read("app0:vpkgj_daemon.suprx", a) && fs::read(DAEMON_PATH, b) && a != b)
-            fs::write(DAEMON_PATH, a);
+    if (fs::exists(APP_DIR + "/update.ready")) {
+        sceIoRemove((APP_DIR + "/update.ready").c_str());
+        fs::rmtree(APP_DIR + "/update");
+        log_line("stale update dropped");
+    }
+    {
+        std::string done;
+        if (fs::read(APP_DIR + "/update.done", done)) {
+            sceIoRemove((APP_DIR + "/update.done").c_str());
+            log_line("updated by daemon to %s", trim(done).c_str());
+            show_toast("VPKGJ обновлён до " + std::string(VPKGJ_VERSION));
+        }
+    }
+    if (daemon_enabled()) {
+        Entry d;
+        d.cat = CAT_PLUGINS;
+        d.id = "vpkgj_daemon";
+        std::string rec = installed.version_of(d);
+        if (!fs::exists(DAEMON_PATH) || rec.empty() || rec == "-" || version_cmp(rec, VPKGJ_VERSION) < 0) {
+            if (daemon_from_app())
+                log_line("daemon synced from app %s", VPKGJ_VERSION);
+        }
     }
     images.start();
     images.set_media(catalog.media);

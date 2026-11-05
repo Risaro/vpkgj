@@ -1,22 +1,29 @@
 #include <psp2/io/fcntl.h>
+#include <psp2/io/dirent.h>
 #include <psp2/io/stat.h>
+#include <psp2/appmgr.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/modulemgr.h>
+#include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/threadmgr.h>
-#include <psp2/libssl.h>
-#include <psp2/net/http.h>
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
 #include <taihen.h>
 #include <taipool.h>
 
+#include "dnet.h"
+
+static void dlog(const char* fmt, ...);
+#include <stdarg.h>
+
 #define DIR "ux0:data/VPKGJ"
-#define INDEX_MAX (768 * 1024)
-#define CHUNK (128 * 1024)
+#define INDEX_MAX (384 * 1024)
+#define CHUNK (32 * 1024)
 #define QUEUE_MAX (16 * 1024)
 #define NET_SIZE (141 * 1024)
 #define APP_ID "VPKG00001"
+#define TLS_POOL (96 * 1024)
 
 const int sceKernelPreloadModuleInhibit = SCE_KERNEL_PRELOAD_INHIBIT_LIBDBG;
 
@@ -74,6 +81,7 @@ static void append_file(const char* path, const char* text, int len)
     SceUID f = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND, 0777);
     if (f >= 0) {
         sceIoWrite(f, text, len);
+        sceIoSyncByFd(f, 0);
         sceIoClose(f);
     }
 }
@@ -124,36 +132,9 @@ typedef int (*Sink)(const char* data, int len);
 
 static int http_get(const char* url, Sink sink)
 {
-    int ok = 0;
-    int tpl = sceHttpCreateTemplate("VPKGJ-daemon/1.0", SCE_HTTP_VERSION_1_1, 1);
-    if (tpl < 0)
-        return 0;
-    sceHttpSetConnectTimeOut(tpl, 20 * 1000 * 1000);
-    sceHttpSetRecvTimeOut(tpl, 60 * 1000 * 1000);
-    int conn = sceHttpCreateConnectionWithURL(tpl, url, 0);
-    if (conn >= 0) {
-        int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0);
-        if (req >= 0) {
-            int status = 0;
-            if (sceHttpSendRequest(req, 0, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0 && status == 200) {
-                ok = 1;
-                for (;;) {
-                    int n = sceHttpReadData(req, chunk, CHUNK);
-                    if (n < 0)
-                        ok = 0;
-                    if (n <= 0)
-                        break;
-                    if (!sink(chunk, n)) {
-                        ok = 0;
-                        break;
-                    }
-                }
-            }
-            sceHttpDeleteRequest(req);
-        }
-        sceHttpDeleteConnection(conn);
-    }
-    sceHttpDeleteTemplate(tpl);
+    int ok = dnet_get(url, 0, 0, sink);
+    if (!ok)
+        dlog("get %s: http %d err 0x%08X", url, dnet_status, (unsigned)dnet_err);
     return ok;
 }
 
@@ -294,10 +275,16 @@ static int patches_sink(const char* d, int n)
     return 1;
 }
 
+static void dlog(const char* fmt, ...);
+
 static void notify(const char* text)
 {
-    if (!notice_init || !set_utf8 || !notice_clean || !lsdb_send)
+    if (!lsdb_send)
+        taiGetModuleExportFunc("SceLsdb", 0xFFFFFFFF, 0x315B9FD6, (uintptr_t*)&lsdb_send);
+    if (!notice_init || !set_utf8 || !notice_clean || !lsdb_send) {
+        dlog("notify skipped: no shell funcs (%d%d%d%d)", notice_init != 0, set_utf8 != 0, notice_clean != 0, lsdb_send != 0);
         return;
+    }
     char data[0x100];
     notice_init(data);
     set_utf8(&data[0x0], APP_ID, 9);
@@ -310,8 +297,9 @@ static void notify(const char* text)
     *(uint32_t*)(&data[0xC8]) = 0x20000;
     set_utf8(&data[0xCC], APP_ID, 9);
     set_utf8(&data[0xD8], "updates", 7);
-    lsdb_send(data, 1);
+    int r = lsdb_send(data, 1);
     notice_clean(data);
+    dlog("notify 0x%08X: %s", (unsigned)r, text);
 }
 
 static void check(void)
@@ -322,9 +310,9 @@ static void check(void)
         sceClibSnprintf(repo, sizeof(repo), "Risaro/vpkgj-db");
     if (!config_value(cfg, "branch", branch, sizeof(branch)))
         sceClibSnprintf(branch, sizeof(branch), "main");
-    read_file(DIR "/installed.txt", installed, 32 * 1024);
-    read_file(DIR "/game_versions.txt", versions, 32 * 1024);
-    read_file(DIR "/notified.txt", notified, 64 * 1024);
+    read_file(DIR "/installed.txt", installed, 16 * 1024);
+    read_file(DIR "/game_versions.txt", versions, 16 * 1024);
+    read_file(DIR "/notified.txt", notified, 16 * 1024);
     fresh_len = 0;
     fresh[0] = 0;
     found = 0;
@@ -404,6 +392,37 @@ static void write_file(const char* path, const char* text, int len)
 
 static void drain_queue(void);
 
+static void dlog(const char* fmt, ...)
+{
+    char text[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = sceClibSnprintf(text, sizeof(text), "%u ", (unsigned)(sceKernelGetSystemTimeWide() / 1000000ull));
+    n += sceClibVsnprintf(text + n, sizeof(text) - n - 1, fmt, ap);
+    va_end(ap);
+    if (n > (int)sizeof(text) - 2)
+        n = sizeof(text) - 2;
+    text[n++] = '\n';
+    if (file_size(DIR "/daemon.log") > 32 * 1024) {
+        sceIoRemove(DIR "/daemon.old");
+        sceIoRename(DIR "/daemon.log", DIR "/daemon.old");
+    }
+    append_file(DIR "/daemon.log", text, n);
+}
+
+static unsigned long long beat_at;
+
+static void beat(void)
+{
+    unsigned long long t = sceKernelGetSystemTimeWide() / 1000000ull;
+    if (beat_at && t - beat_at < 30)
+        return;
+    beat_at = t;
+    char text[32];
+    int n = sceClibSnprintf(text, sizeof(text), "%u\n", (unsigned)t);
+    write_file(DIR "/daemon.alive", text, n);
+}
+
 static char cur_key[128];
 static char cur_name[96];
 static unsigned long long state_at;
@@ -420,74 +439,91 @@ static int stop_requested(void)
     return exists(DIR "/bgq.stop") || exists(DIR "/daemon_off");
 }
 
+static SceUID dl_fd;
+static unsigned long long dl_have, dl_total, dl_done;
+static int dl_fill, dl_half, dl_bad;
+static const char* dl_part;
+
+static int dl_flush(void)
+{
+    if (dl_fill && sceIoWrite(dl_fd, chunk, dl_fill) != dl_fill)
+        dl_bad = 1;
+    dl_fill = 0;
+    return !dl_bad;
+}
+
+static int dl_head(int status, unsigned long long len)
+{
+    if (status == 416)
+        sceIoRemove(dl_part);
+    if (status != 200 && status != 206)
+        return 0;
+    if (status == 200)
+        dl_have = 0;
+    dl_total = len ? dl_have + len : 0;
+    dl_done = dl_have;
+    dl_half = dl_total ? (int)(dl_have * 4 / dl_total) : 4;
+    save_state(dl_have, dl_total);
+    dl_fd = sceIoOpen(dl_part, SCE_O_WRONLY | SCE_O_CREAT | (dl_have ? SCE_O_APPEND : SCE_O_TRUNC), 0777);
+    return dl_fd >= 0;
+}
+
+static int dl_sink(const char* d, int n)
+{
+    while (n > 0) {
+        int k = CHUNK - dl_fill;
+        if (k > n)
+            k = n;
+        sceClibMemcpy(chunk + dl_fill, d, k);
+        dl_fill += k;
+        d += k;
+        n -= k;
+        dl_done += k;
+        if (dl_fill == CHUNK && !dl_flush())
+            return 0;
+    }
+    beat();
+    if (dl_total >= 32ull * 1024 * 1024) {
+        int q = (int)(dl_done * 4 / dl_total);
+        if (q > dl_half && q < 4) {
+            dl_half = q;
+            char text[200];
+            unsigned mb = (unsigned)(dl_done >> 20), all = (unsigned)(dl_total >> 20);
+            sceClibSnprintf(text, sizeof(text), "%s: %d%% (%u из %u МБ)", cur_name, q * 25, mb, all);
+            notify(text);
+        }
+    }
+    if (dl_done - state_at >= 512 * 1024) {
+        state_at = dl_done;
+        save_state(dl_done, dl_total);
+        drain_queue();
+        if (stop_requested())
+            return 0;
+    }
+    return 1;
+}
+
 static int download(const char* url, const char* path)
 {
     char part[200];
     sceClibSnprintf(part, sizeof(part), "%s.part", path);
     long long have = file_size(part);
-    if (have < 0)
-        have = 0;
-    int ok = 0;
-    int tpl = sceHttpCreateTemplate("VPKGJ-daemon/1.0", SCE_HTTP_VERSION_1_1, 1);
-    if (tpl < 0)
-        return 0;
-    sceHttpSetConnectTimeOut(tpl, 20 * 1000 * 1000);
-    sceHttpSetRecvTimeOut(tpl, 60 * 1000 * 1000);
-    sceHttpSetAutoRedirect(tpl, 1);
-    int conn = sceHttpCreateConnectionWithURL(tpl, url, 1);
-    if (conn >= 0) {
-        int req = sceHttpCreateRequestWithURL(conn, SCE_HTTP_METHOD_GET, url, 0);
-        if (req >= 0) {
-            if (have > 0) {
-                char range[48];
-                sceClibSnprintf(range, sizeof(range), "bytes=%u-", (unsigned)have);
-                sceHttpAddRequestHeader(req, "Range", range, SCE_HTTP_HEADER_ADD);
-            }
-            int status = 0;
-            if (sceHttpSendRequest(req, 0, 0) >= 0 && sceHttpGetStatusCode(req, &status) >= 0 && (status == 200 || status == 206)) {
-                unsigned long long len = 0;
-                if (sceHttpGetResponseContentLength(req, &len) < 0)
-                    len = 0;
-                if (status == 200)
-                    have = 0;
-                unsigned long long total = len ? have + len : 0;
-                SceUID f = sceIoOpen(part, SCE_O_WRONLY | SCE_O_CREAT | (have ? SCE_O_APPEND : SCE_O_TRUNC), 0777);
-                if (f >= 0) {
-                    unsigned long long done = have;
-                    ok = 1;
-                    for (;;) {
-                        int n = sceHttpReadData(req, chunk, CHUNK);
-                        if (n < 0)
-                            ok = 0;
-                        if (n <= 0)
-                            break;
-                        if (sceIoWrite(f, chunk, n) != n) {
-                            ok = 0;
-                            break;
-                        }
-                        done += n;
-                        if (done - state_at >= 2 * 1024 * 1024) {
-                            state_at = done;
-                            save_state(done, total);
-                            drain_queue();
-                            if (stop_requested()) {
-                                ok = 0;
-                                break;
-                            }
-                        }
-                    }
-                    sceIoClose(f);
-                    if (ok && total && done < total)
-                        ok = 0;
-                }
-            } else if (status == 416) {
-                sceIoRemove(part);
-            }
-            sceHttpDeleteRequest(req);
-        }
-        sceHttpDeleteConnection(conn);
+    dl_have = have < 0 ? 0 : (unsigned long long)have;
+    dl_part = part;
+    dl_fd = -1;
+    dl_fill = 0;
+    dl_bad = 0;
+    int ok = dnet_get(url, dl_have, dl_head, dl_sink);
+    if (dl_fd >= 0) {
+        if (!dl_flush())
+            ok = 0;
+        sceIoClose(dl_fd);
+        dl_fd = -1;
     }
-    sceHttpDeleteTemplate(tpl);
+    if (ok && dl_total && dl_done < dl_total)
+        ok = 0;
+    if (!ok)
+        dlog("http %d err 0x%08X", dnet_status, (unsigned)dnet_err);
     if (ok) {
         sceIoRemove(path);
         ok = sceIoRename(part, path) >= 0;
@@ -559,12 +595,11 @@ static void drop_first(int keep_key_done)
 static int process_queue(void)
 {
     if (exists(DIR "/bgq.stop")) {
-        sceIoRemove(DIR "/bgq.txt");
-        sceIoRemove(DIR "/bgq.add");
         sceIoRemove(DIR "/bgq.stop");
         sceIoRemove(DIR "/bgstate.txt");
         fails = 0;
-        return 0;
+        retry_at = 0;
+        dlog("stop");
     }
     merge_added();
     if (read_file(DIR "/bgq.txt", bgq, QUEUE_MAX) <= 0) {
@@ -582,6 +617,14 @@ static int process_queue(void)
         drop_first(0);
         return 1;
     }
+    dlog("download %s", cur_name);
+    static char started_key[128];
+    if (sceClibStrncmp(started_key, cur_key, sizeof(started_key))) {
+        sceClibSnprintf(started_key, sizeof(started_key), "%s", cur_key);
+        char text[160];
+        sceClibSnprintf(text, sizeof(text), "Качаю в фоне: %s", cur_name);
+        notify(text);
+    }
     hash_name(url, hash);
     sceClibSnprintf(path, sizeof(path), DIR "/bg/%s", hash);
     sceIoMkdir(DIR "/bg", 0777);
@@ -593,6 +636,7 @@ static int process_queue(void)
             if (stop_requested())
                 return 0;
             fails++;
+            dlog("download failed %d: %s", fails, cur_name);
             if (fails >= 6) {
                 char text[200];
                 sceClibSnprintf(text, sizeof(text), "Не удалось скачать в фоне: %s", cur_name);
@@ -606,6 +650,7 @@ static int process_queue(void)
         }
     }
     fails = 0;
+    dlog("done %s", cur_name);
     drop_first(1);
     sceIoRemove(DIR "/bgstate.txt");
     return 1;
@@ -640,34 +685,114 @@ static void drain_queue(void)
     }
 }
 
+static int move_tree(const char* src, const char* dst)
+{
+    sceIoMkdir(dst, 0777);
+    SceUID d = sceIoDopen(src);
+    if (d < 0)
+        return 0;
+    int ok = 1;
+    SceIoDirent e;
+    for (;;) {
+        sceClibMemset(&e, 0, sizeof(e));
+        if (sceIoDread(d, &e) <= 0)
+            break;
+        if (!e.d_name[0] || !sceClibStrcmp(e.d_name, ".") || !sceClibStrcmp(e.d_name, ".."))
+            continue;
+        char s2[320], d2[320];
+        sceClibSnprintf(s2, sizeof(s2), "%s/%s", src, e.d_name);
+        sceClibSnprintf(d2, sizeof(d2), "%s/%s", dst, e.d_name);
+        if (SCE_S_ISDIR(e.d_stat.st_mode)) {
+            if (!move_tree(s2, d2))
+                ok = 0;
+        } else {
+            sceIoRemove(d2);
+            int r = sceIoRename(s2, d2);
+            if (r < 0) {
+                dlog("update move %s: 0x%08X", d2, (unsigned)r);
+                ok = 0;
+            }
+        }
+    }
+    sceIoDclose(d);
+    sceIoRmdir(src);
+    return ok;
+}
+
+static unsigned long long update_seen;
+
+static int apply_update(void)
+{
+    if (!exists(DIR "/update.ready")) {
+        update_seen = 0;
+        return 0;
+    }
+    if (!update_seen) {
+        update_seen = now_s();
+        dlog("update ready, waiting for app to close");
+        return 1;
+    }
+    if (now_s() - update_seen < 3)
+        return 1;
+    char ver[32];
+    read_file(DIR "/update.ready", ver, sizeof(ver));
+    if (!exists(DIR "/update/eboot.bin")) {
+        dlog("update without eboot, dropped");
+        sceIoRemove(DIR "/update.ready");
+        return 0;
+    }
+    dlog("update apply %s", ver);
+    int ok = move_tree(DIR "/update", "ux0:app/" APP_ID);
+    sceIoRemove(DIR "/update.ready");
+    update_seen = 0;
+    char text[160];
+    if (ok) {
+        write_file(DIR "/update.done", ver, slen(ver));
+        sceClibSnprintf(text, sizeof(text), "VPKGJ обновлён до %s", ver);
+    } else {
+        sceClibSnprintf(text, sizeof(text), "Не удалось обновить VPKGJ до %s, открой его и повтори", ver);
+    }
+    notify(text);
+    int r = sceAppMgrLaunchAppByUri(0xFFFFF, "psgm:play?titleid=" APP_ID);
+    dlog("update %s, launch 0x%08X", ok ? "done" : "failed", (unsigned)r);
+    return 0;
+}
+
 static int daemon_thread(SceSize args, void* argp)
 {
-    taiGetModuleExportFunc("SceLsdb", 0xFFFFFFFF, 0x315B9FD6, (uintptr_t*)&lsdb_send);
-    sceKernelDelayThread(20 * 1000 * 1000);
-    for (int i = 0; i < 14; i++) {
-        drain_queue();
+    sceIoMkdir(DIR, 0777);
+    beat();
+    dlog("start");
+    dnet_log = dlog;
+    for (int i = 0; i < 3; i++) {
         sceKernelDelayThread(5 * 1000 * 1000);
+        beat();
     }
+    int lr = taiGetModuleExportFunc("SceLsdb", 0xFFFFFFFF, 0x315B9FD6, (uintptr_t*)&lsdb_send);
+    dlog("lsdb 0x%08X %d", (unsigned)lr, lsdb_send != 0);
     sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
-    sceSysmoduleLoadModule(SCE_SYSMODULE_HTTPS);
     if (sceNetShowNetstat() == SCE_NET_ERROR_ENOTINIT) {
         SceNetInitParam p;
-        p.memory = taipool_alloc(NET_SIZE);
+        SceUID blk = sceKernelAllocMemBlock("vpkgj_net", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, 144 * 1024, 0);
+        p.memory = 0;
+        if (blk >= 0)
+            sceKernelGetMemBlockBase(blk, &p.memory);
+        dlog("net init needed, mem %d", p.memory != 0);
         p.size = NET_SIZE;
         p.flags = 0;
-        sceNetInit(&p);
+        if (p.memory)
+            sceNetInit(&p);
     }
     sceNetCtlInit();
-    sceHttpInit(0x40000);
-    sceSslInit(0x40000);
-    sceHttpsDisableOption(SCE_HTTPS_FLAG_SERVER_VERIFY);
-    unsigned long long next_check = 0;
+    dlog("net ready, online %d", online());
+    unsigned long long next_check = now_s() + 60;
     for (;;) {
+        beat();
         SceIoStat st;
         int off = sceIoGetstat(DIR "/daemon_off", &st) >= 0;
-        if (!off && now_s() >= next_check && online()) {
-            check();
-            next_check = now_s() + 6 * 3600;
+        if (!off && apply_update()) {
+            sceKernelDelayThread(1000 * 1000);
+            continue;
         }
         if (!off) {
             drain_queue();
@@ -675,10 +800,16 @@ static int daemon_thread(SceSize args, void* argp)
                 sceKernelDelayThread(300 * 1000);
                 continue;
             }
+            if (now_s() >= next_check && online() && !exists(DIR "/bgq.txt") && !exists(DIR "/bgq.add")) {
+                dlog("check");
+                check();
+                dlog("check done, found %d", found);
+                next_check = now_s() + 6 * 3600;
+            }
         } else {
             sceIoRemove(DIR "/notify.txt");
         }
-        sceKernelDelayThread(5 * 1000 * 1000);
+        sceKernelDelayThread(2 * 1000 * 1000);
     }
     return 0;
 }
@@ -708,20 +839,21 @@ int module_start(SceSize argc, const void* args)
     default:
         return SCE_KERNEL_START_FAILED;
     }
-    taipool_init(INDEX_MAX + CHUNK + 2048 + 32 * 1024 * 2 + 64 * 1024 + 16 * 1024 + 4096 + QUEUE_MAX * 2 + NET_SIZE + 64 * 1024);
+    taipool_init(16 * 1024 + INDEX_MAX + CHUNK + 2048 + 16 * 1024 * 4 + 4096 + QUEUE_MAX * 2 + TLS_POOL);
     index_buf = taipool_alloc(INDEX_MAX);
     chunk = taipool_alloc(CHUNK);
     line = taipool_alloc(2048);
-    installed = taipool_alloc(32 * 1024);
-    versions = taipool_alloc(32 * 1024);
-    notified = taipool_alloc(64 * 1024);
+    installed = taipool_alloc(16 * 1024);
+    versions = taipool_alloc(16 * 1024);
+    notified = taipool_alloc(16 * 1024);
     fresh = taipool_alloc(16 * 1024);
     queue_buf = taipool_alloc(4096);
     bgq = taipool_alloc(QUEUE_MAX);
     bgadd = taipool_alloc(QUEUE_MAX);
+    dnet_heap(taipool_alloc(TLS_POOL), TLS_POOL);
     if (!bgq || !bgadd || !queue_buf || !index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
         return SCE_KERNEL_START_FAILED;
-    SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xB0, 0x10000, 0, 0, 0);
+    SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xB0, 0x20000, 0, 0, 0);
     if (th >= 0)
         sceKernelStartThread(th, 0, 0);
     return SCE_KERNEL_START_SUCCESS;

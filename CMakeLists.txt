@@ -13,7 +13,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "VPKGJ")
 set(VITA_TITLEID "VPKG00001")
-set(VITA_VERSION "01.30")
+set(VITA_VERSION "01.50")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -80,6 +80,7 @@ target_link_libraries(vpkgj
   SceRtc_stub
   SceKernelThreadMgr_stub
   SceKernelModulemgr_stub
+  SceSysmem_stub
   SceIofilemgr_stub
   SceProcessmgr_stub
   SceLibKernel_stub
@@ -88,7 +89,11 @@ target_link_libraries(vpkgj
 
 vita_create_self(eboot.bin vpkgj UNSAFE)
 
-add_executable(vpkgj_daemon daemon/main.c)
+file(GLOB MBEDTLS_SRC ${CMAKE_SOURCE_DIR}/daemon/mbedtls/library/*.c)
+add_executable(vpkgj_daemon daemon/main.c daemon/dnet.c ${MBEDTLS_SRC})
+target_include_directories(vpkgj_daemon PRIVATE ${CMAKE_SOURCE_DIR}/daemon ${CMAKE_SOURCE_DIR}/daemon/mbedtls/include ${CMAKE_SOURCE_DIR}/daemon/mbedtls/library)
+target_compile_definitions(vpkgj_daemon PRIVATE MBEDTLS_CONFIG_FILE="tls_config.h")
+target_compile_options(vpkgj_daemon PRIVATE -Os -fno-builtin)
 target_link_libraries(vpkgj_daemon
   taihen_stub
   taipool
@@ -97,11 +102,11 @@ target_link_libraries(vpkgj_daemon
   SceLibKernel_stub_weak
   SceKernelThreadMgr_stub
   SceKernelModulemgr_stub
+  SceSysmem_stub
+  SceAppMgr_stub
   SceSysmodule_stub
   SceNet_stub_weak
   SceNetCtl_stub_weak
-  SceHttp_stub_weak
-  SceSsl_stub_weak
   SceIofilemgr_stub
   SceLibc_stub_weak
 )
