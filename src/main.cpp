@@ -2542,7 +2542,7 @@ void App::ask_app_update(bool manual)
         e.name = "VPKGJ " + catalog.app_version;
         e.version = catalog.app_version;
         e.url = catalog.app_url;
-        e.install = daemon_enabled() && daemon_alive() ? "self_daemon" : "self";
+        e.install = "self_daemon";
         tasks.add(e);
         set_tab(TAB_DOWNLOADS);
         screen = SCR_BROWSE;
@@ -2580,6 +2580,11 @@ void App::check_reboot()
             std::string ver = t->entry.version;
             auto apply = [this, ver]() {
                 fs::write(APP_DIR + "/update.ready", ver);
+                if (!daemon_enabled() || !daemon_alive()) {
+                    log_line("update %s waits for daemon repair", ver.c_str());
+                    daemon_repair(true);
+                    return;
+                }
                 log_line("update %s handed to daemon", ver.c_str());
                 tasks.stop();
                 images.stop();
@@ -3370,10 +3375,16 @@ void App::run()
     load_prefs();
     apply_speed();
     rebuild();
-    if (fs::exists(APP_DIR + "/update.ready")) {
-        sceIoRemove((APP_DIR + "/update.ready").c_str());
-        fs::rmtree(APP_DIR + "/update");
-        log_line("stale update dropped");
+    {
+        std::string ready;
+        if (fs::read(APP_DIR + "/update.ready", ready) && version_cmp(trim(ready), VPKGJ_VERSION) <= 0) {
+            sceIoRemove((APP_DIR + "/update.ready").c_str());
+            fs::rmtree(APP_DIR + "/update");
+            log_line("stale update dropped");
+        } else if (!ready.empty()) {
+            sceIoRemove((APP_DIR + "/update.ready").c_str());
+            log_line("update %s postponed, app opened first", trim(ready).c_str());
+        }
     }
     {
         std::string done;
