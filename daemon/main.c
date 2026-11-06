@@ -18,7 +18,6 @@ static void dlog(const char* fmt, ...);
 #include <stdarg.h>
 
 #define DIR "ux0:data/VPKGJ"
-#define INDEX_MAX (384 * 1024)
 #define CHUNK (32 * 1024)
 #define QUEUE_MAX (16 * 1024)
 #define NET_SIZE (141 * 1024)
@@ -32,7 +31,7 @@ static int (*set_utf8)(void* data, const char* text, SceSize len);
 static int (*notice_clean)(void* data);
 static int (*lsdb_send)(void* data, int a2);
 
-static char* index_buf;
+static unsigned int shell_nid;
 static char* chunk;
 static char* line;
 static char* installed;
@@ -138,34 +137,6 @@ static int http_get(const char* url, Sink sink)
     return ok;
 }
 
-static int index_len;
-
-static int index_sink(const char* d, int n)
-{
-    if (index_len + n >= INDEX_MAX)
-        return 0;
-    sceClibMemcpy(index_buf + index_len, d, n);
-    index_len += n;
-    index_buf[index_len] = 0;
-    return 1;
-}
-
-static const char* json_str(const char* from, const char* end, const char* key, char* out, int max)
-{
-    char pat[48];
-    sceClibSnprintf(pat, sizeof(pat), "\"%s\": \"", key);
-    const char* p = sceClibStrstr(from, pat);
-    out[0] = 0;
-    if (!p || (end && p > end))
-        return 0;
-    p += slen(pat);
-    int i = 0;
-    while (*p && *p != '"' && i < max - 1)
-        out[i++] = *p++;
-    out[i] = 0;
-    return p;
-}
-
 static void remember(const char* key, const char* name)
 {
     if (sceClibStrstr(notified, key))
@@ -181,49 +152,89 @@ static void remember(const char* key, const char* name)
     found++;
 }
 
-static void check_catalog(void)
+static char ix_cat[24];
+static char ix_id[64];
+static char ix_ver[32];
+static char ix_name[96];
+
+static void copy_value(const char* p, char* out, int max)
 {
+    int i = 0;
+    while (*p && *p != '"' && i < max - 1)
+        out[i++] = *p++;
+    out[i] = 0;
+}
+
+static void item_done(void)
+{
+    if (!ix_id[0] || !ix_ver[0] || !ix_cat[0] || !sceClibStrcmp(ix_cat, "games"))
+        return;
+    char pat[96];
+    int pl = sceClibSnprintf(pat, sizeof(pat), "%s/%s\t", ix_cat, ix_id);
     const char* p = installed;
-    while (*p) {
-        char key[64], ver[32];
-        int i = 0;
-        while (*p && *p != '\t' && *p != '\n' && i < 63)
-            key[i++] = *p++;
-        key[i] = 0;
-        i = 0;
-        if (*p == '\t')
-            p++;
-        while (*p && *p != '\n' && *p != '\r' && i < 31)
-            ver[i++] = *p++;
-        ver[i] = 0;
-        while (*p == '\r' || *p == '\n')
-            p++;
-        char* slash = sceClibStrstr(key, "/");
-        if (!slash || sceClibStrncmp(key, "games/", 6) == 0)
-            continue;
-        char pat[64];
-        const char* id = slash + 1;
-        int plugins = !sceClibStrncmp(key, "plugins/", 8);
-        sceClibSnprintf(pat, sizeof(pat), plugins ? "\"id\": \"%s\"" : "\"titleid\": \"%s\"", id);
-        const char* obj = sceClibStrstr(index_buf, pat);
-        if (!obj)
-            continue;
-        const char* end = sceClibStrstr(obj, "}");
-        const char* start = obj;
-        while (start > index_buf && *start != '{')
-            start--;
-        char nver[32], name[96];
-        json_str(start, end, "version", nver, sizeof(nver));
-        json_str(start, end, "name", name, sizeof(name));
-        if (!nver[0] || !sceClibStrncmp(nver, ver, 32))
-            continue;
-        char nk[128];
-        sceClibSnprintf(nk, sizeof(nk), "%s/%s\n", key, nver);
-        remember(nk, name);
+    while ((p = sceClibStrstr(p, pat)) && p != installed && p[-1] != '\n')
+        p += pl;
+    if (!p)
+        return;
+    p += pl;
+    char ver[32];
+    int i = 0;
+    while (p[i] && p[i] != '\n' && p[i] != '\r' && i < 31) {
+        ver[i] = p[i];
+        i++;
+    }
+    ver[i] = 0;
+    if (!sceClibStrncmp(ix_ver, ver, 32))
+        return;
+    char nk[160];
+    sceClibSnprintf(nk, sizeof(nk), "%s/%s/%s\n", ix_cat, ix_id, ix_ver);
+    remember(nk, ix_name[0] ? ix_name : ix_id);
+}
+
+static void index_line(char* l)
+{
+    if (l[0] == ' ' && l[1] == ' ' && l[2] == '"') {
+        copy_value(l + 3, ix_cat, sizeof(ix_cat));
+        ix_id[0] = ix_ver[0] = ix_name[0] = 0;
+        return;
+    }
+    if (!sceClibStrncmp(l, "    \"", 5)) {
+        char* k = l + 5;
+        if (!sceClibStrncmp(k, "titleid\": \"", 11))
+            copy_value(k + 11, ix_id, sizeof(ix_id));
+        else if (!sceClibStrncmp(k, "id\": \"", 6))
+            copy_value(k + 6, ix_id, sizeof(ix_id));
+        else if (!sceClibStrncmp(k, "version\": \"", 11))
+            copy_value(k + 11, ix_ver, sizeof(ix_ver));
+        else if (!sceClibStrncmp(k, "name\": \"", 8))
+            copy_value(k + 8, ix_name, sizeof(ix_name));
+        return;
+    }
+    if (!sceClibStrncmp(l, "   }", 4)) {
+        item_done();
+        ix_id[0] = ix_ver[0] = ix_name[0] = 0;
     }
 }
 
 static int carry;
+static void (*line_fn)(char* l);
+
+static int line_sink(const char* d, int n)
+{
+    for (int i = 0; i < n; i++) {
+        char c = d[i];
+        if (c == '\n') {
+            line[carry] = 0;
+            if (carry && line[carry - 1] == '\r')
+                line[carry - 1] = 0;
+            line_fn(line);
+            carry = 0;
+        } else if (carry < 2047) {
+            line[carry++] = c;
+        }
+    }
+    return 1;
+}
 
 static void patch_line(char* l)
 {
@@ -256,23 +267,6 @@ static void patch_line(char* l)
     char nk[64];
     sceClibSnprintf(nk, sizeof(nk), "games/%s/%s\n", f[0], f[3]);
     remember(nk, f[2]);
-}
-
-static int patches_sink(const char* d, int n)
-{
-    for (int i = 0; i < n; i++) {
-        char c = d[i];
-        if (c == '\n') {
-            line[carry] = 0;
-            if (carry && line[carry - 1] == '\r')
-                line[carry - 1] = 0;
-            patch_line(line);
-            carry = 0;
-        } else if (carry < 2047) {
-            line[carry++] = c;
-        }
-    }
-    return 1;
 }
 
 static void dlog(const char* fmt, ...);
@@ -319,10 +313,10 @@ static void check(void)
     first_name[0] = 0;
     if (installed[0]) {
         sceClibSnprintf(url, sizeof(url), "https://raw.githubusercontent.com/%s/%s/index.json", repo, branch);
-        index_len = 0;
-        index_buf[0] = 0;
-        if (http_get(url, index_sink))
-            check_catalog();
+        carry = 0;
+        ix_cat[0] = ix_id[0] = ix_ver[0] = ix_name[0] = 0;
+        line_fn = index_line;
+        http_get(url, line_sink);
     }
     if (versions[0]) {
         char pkgj[2048];
@@ -330,7 +324,8 @@ static void check(void)
             read_file("ur0:pkgj/config.txt", pkgj, sizeof(pkgj));
         if (config_value(pkgj, "url_updates", url, sizeof(url))) {
             carry = 0;
-            http_get(url, patches_sink);
+            line_fn = patch_line;
+            http_get(url, line_sink);
         }
     }
     if (!found)
@@ -762,7 +757,7 @@ static int daemon_thread(SceSize args, void* argp)
 {
     sceIoMkdir(DIR, 0777);
     beat();
-    dlog("start");
+    dlog("start, shell 0x%08X, notices %d", shell_nid, notice_init != 0);
     dnet_log = dlog;
     for (int i = 0; i < 3; i++) {
         sceKernelDelayThread(5 * 1000 * 1000);
@@ -837,10 +832,10 @@ int module_start(SceSize argc, const void* args)
         module_offset(info.modid, 0, 0x416830 | 1, &notice_clean);
         break;
     default:
-        return SCE_KERNEL_START_FAILED;
+        break;
     }
-    taipool_init(16 * 1024 + INDEX_MAX + CHUNK + 2048 + 16 * 1024 * 4 + 4096 + QUEUE_MAX * 2 + TLS_POOL);
-    index_buf = taipool_alloc(INDEX_MAX);
+    shell_nid = info.module_nid;
+    taipool_init(16 * 1024 + CHUNK + 2048 + 16 * 1024 * 4 + 4096 + QUEUE_MAX * 2 + TLS_POOL);
     chunk = taipool_alloc(CHUNK);
     line = taipool_alloc(2048);
     installed = taipool_alloc(16 * 1024);
@@ -851,7 +846,7 @@ int module_start(SceSize argc, const void* args)
     bgq = taipool_alloc(QUEUE_MAX);
     bgadd = taipool_alloc(QUEUE_MAX);
     dnet_heap(taipool_alloc(TLS_POOL), TLS_POOL);
-    if (!bgq || !bgadd || !queue_buf || !index_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
+    if (!bgq || !bgadd || !queue_buf || !chunk || !line || !installed || !versions || !notified || !fresh)
         return SCE_KERNEL_START_FAILED;
     SceUID th = sceKernelCreateThread("vpkgj_daemon", daemon_thread, 0xB0, 0x20000, 0, 0, 0);
     if (th >= 0)
