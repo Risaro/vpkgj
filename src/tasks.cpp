@@ -12,7 +12,11 @@
 #include <psp2/kernel/cpu.h>
 #include <psp2/kernel/threadmgr.h>
 
+#include <mbedtls/sha256.h>
+
 #include <algorithm>
+#include <map>
+#include <set>
 #include <sstream>
 
 static const std::string TEMP = "ux0:temp/vpkgj";
@@ -102,6 +106,256 @@ static bool download(Task& t, const std::vector<std::string>& urls, const std::s
     return false;
 }
 
+static std::vector<std::string> split(const std::string& s, char sep)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s + sep) {
+        if (c == sep) {
+            if (!trim(cur).empty())
+                out.push_back(trim(cur));
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    return out;
+}
+
+static const char* FIX_SOON = ". Мы уже знаем, скоро поправим";
+
+static bool sha_file(const std::string& path, std::string& out, net::Progress* p)
+{
+    SceUID f = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
+    if (f < 0)
+        return false;
+    mbedtls_sha256_context c;
+    mbedtls_sha256_init(&c);
+    mbedtls_sha256_starts(&c, 0);
+    std::vector<uint8_t> buf(512 * 1024);
+    uint64_t done = 0;
+    if (p) {
+        p->total = fs::size(path);
+        p->done = 0;
+    }
+    int r;
+    while ((r = sceIoRead(f, buf.data(), buf.size())) > 0) {
+        mbedtls_sha256_update(&c, buf.data(), r);
+        done += r;
+        if (p)
+            p->done = done;
+        if (p && p->cancel)
+            break;
+    }
+    sceIoClose(f);
+    unsigned char d[32];
+    mbedtls_sha256_finish(&c, d);
+    mbedtls_sha256_free(&c);
+    static const char* hx = "0123456789abcdef";
+    out.clear();
+    for (unsigned char b : d) {
+        out += hx[b >> 4];
+        out += hx[b & 15];
+    }
+    return r >= 0 && !(p && p->cancel);
+}
+
+static bool is_zip(const std::string& path);
+
+static bool fetch_checked(Task& t, const std::vector<std::string>& urls, const std::string& path, const std::string& sha,
+                          const char* what, std::string& err)
+{
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (!download(t, urls, path, err))
+            return false;
+        if (sha.size() == 64) {
+            t.set_stage("Проверка хеша");
+            std::string h;
+            if (!sha_file(path, h, &t.progress)) {
+                err = t.progress.cancel ? "Отменено" : "Не удалось прочитать скачанный файл";
+                return false;
+            }
+            if (lower(sha) != h) {
+                log_line("sha mismatch %s: %s", what, h.c_str());
+                err = std::string("Не прошла проверка: ") + what + " скачался битым, хеш не совпал" + FIX_SOON;
+                sceIoRemove(path.c_str());
+                continue;
+            }
+        }
+        if (is_zip(path)) {
+            t.set_stage(std::string("Проверка ") + what);
+            if (!zip_test(path, &t.progress, err)) {
+                if (t.progress.cancel)
+                    return false;
+                log_line("zip test %s: %s", what, err.c_str());
+                err = std::string("Не прошла проверка: ") + what + " битый. " + err + FIX_SOON;
+                sceIoRemove(path.c_str());
+                continue;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+static std::string norm_dest(const std::string& d)
+{
+    std::string r = trim(d).empty() ? "ux0:data" : trim(d);
+    while (r.size() > 4 && r.back() == '/')
+        r.pop_back();
+    return r;
+}
+
+static std::vector<std::pair<std::string, std::string>> data_parts(const Entry& e)
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    for (auto& part : split(e.data, ';')) {
+        std::string src = trim(part), dest = e.data_path;
+        if (src.empty())
+            continue;
+        size_t gt = src.find('>');
+        if (gt != std::string::npos) {
+            dest = trim(src.substr(gt + 1));
+            src = trim(src.substr(0, gt));
+        }
+        out.push_back({src, norm_dest(dest)});
+    }
+    return out;
+}
+
+static std::vector<std::string> top_paths(const std::vector<std::string>& names, const std::string& dest)
+{
+    std::set<std::string> tops;
+    for (auto n : names) {
+        for (auto& c : n)
+            if (c == '\\')
+                c = '/';
+        if (n.empty() || n[0] == '/' || n.find("../") != std::string::npos)
+            continue;
+        size_t s = n.find('/');
+        std::string top = s == std::string::npos ? n : n.substr(0, s);
+        if (!top.empty() && top != "." && top != "__MACOSX")
+            tops.insert(dest + "/" + top);
+    }
+    return std::vector<std::string>(tops.begin(), tops.end());
+}
+
+static Mutex data_m;
+
+static std::string data_key(const Entry& e)
+{
+    return std::string(category_key(e.cat)) + "/" + e.id;
+}
+
+static std::string data_fp(const Entry& e)
+{
+    return hash_name(e.data + "|" + e.data_path);
+}
+
+static std::map<std::string, std::pair<std::string, std::vector<std::string>>> data_load()
+{
+    std::map<std::string, std::pair<std::string, std::vector<std::string>>> m;
+    std::string s;
+    if (!fs::read(APP_DIR + "/datastate.txt", s))
+        return m;
+    std::istringstream in(s);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::vector<std::string> f = split(line, '\t');
+        if (f.size() >= 2)
+            m[f[0]] = {f[1], f.size() > 2 ? split(f[2], '|') : std::vector<std::string>()};
+    }
+    return m;
+}
+
+static void data_record(const Entry& e, const std::vector<std::string>& paths)
+{
+    std::lock_guard<Mutex> lock(data_m);
+    auto m = data_load();
+    m[data_key(e)] = {data_fp(e), paths};
+    std::string s;
+    for (auto& kv : m) {
+        std::string ps;
+        for (auto& p : kv.second.second)
+            ps += (ps.empty() ? "" : "|") + p;
+        s += kv.first + "\t" + kv.second.first + "\t" + ps + "\n";
+    }
+    fs::write(APP_DIR + "/datastate.txt", s);
+}
+
+bool data_installed(const Entry& e, bool probe)
+{
+    if (e.data.empty())
+        return true;
+    {
+        std::lock_guard<Mutex> lock(data_m);
+        auto m = data_load();
+        auto it = m.find(data_key(e));
+        if (it != m.end()) {
+            if (it->second.first != data_fp(e) || it->second.second.empty())
+                return false;
+            for (auto& p : it->second.second)
+                if (!fs::exists(p))
+                    return false;
+            return true;
+        }
+    }
+    if (!probe)
+        return false;
+    std::vector<std::string> paths;
+    for (auto& part : data_parts(e)) {
+        if (lower(part.second) != "ux0:data") {
+            if (!fs::exists(part.second) || fs::list(part.second).empty())
+                return false;
+            paths.push_back(part.second);
+            continue;
+        }
+        std::vector<std::string> names;
+        std::string err;
+        std::string url = first_link(part.first);
+        if (url.empty() || !zip_remote_names(url, names, err))
+            return false;
+        std::vector<std::string> tops = top_paths(names, part.second);
+        if (tops.empty())
+            return false;
+        for (auto& p : tops)
+            if (!fs::exists(p))
+                return false;
+        paths.insert(paths.end(), tops.begin(), tops.end());
+    }
+    if (paths.empty())
+        return false;
+    data_record(e, paths);
+    log_line("data %s already present, recorded", e.id.c_str());
+    return true;
+}
+
+static bool preflight(Task& t, const std::vector<std::pair<std::string, const char*>>& files, std::string& err)
+{
+    t.set_stage("Проверка файлов на сервере");
+    for (auto& f : files) {
+        std::string url = first_link(f.first);
+        if (url.empty()) {
+            err = std::string("Нет ссылки: ") + f.second + FIX_SOON;
+            return false;
+        }
+        std::vector<std::string> names;
+        std::string e;
+        if (zip_remote_names(url, names, e))
+            continue;
+        log_line("preflight %s %s: %s", f.second, url.c_str(), e.c_str());
+        if (starts_with(e, "http 4")) {
+            err = std::string(f.second) + " сейчас недоступен на сервере (" + e.substr(5) + ")" + FIX_SOON;
+            return false;
+        }
+        if (e == "Не zip") {
+            err = std::string(f.second) + " на сервере битый, это не zip" + FIX_SOON;
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool is_zip(const std::string& path)
 {
     SceUID f = sceIoOpen(path.c_str(), SCE_O_RDONLY, 0);
@@ -165,22 +419,6 @@ static bool tai_add(const std::string& section, const std::string& plugin, std::
         return false;
     }
     return true;
-}
-
-static std::vector<std::string> split(const std::string& s, char sep)
-{
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : s + sep) {
-        if (c == sep) {
-            if (!trim(cur).empty())
-                out.push_back(trim(cur));
-            cur.clear();
-        } else {
-            cur += c;
-        }
-    }
-    return out;
 }
 
 bool tai_add_plugin(const std::string& section, const std::string& path, std::string& err)
@@ -531,20 +769,41 @@ void Tasks::run(Task& t)
                 err = "Нет ссылки на PKG";
         }
     } else if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW) {
-        if (enough_space(e, 2.1, err) && download(t, links(e.url, e.data.empty() ? e.mirror : ""), dl, err)) {
+        std::string was = installed->version_of(e);
+        bool skip_data = false;
+        if (!e.data.empty() && !was.empty() && was != (e.version.empty() ? "-" : e.version)) {
+            t.set_stage("Проверка data");
+            skip_data = data_installed(e, true);
+        }
+        auto parts = skip_data ? std::vector<std::pair<std::string, std::string>>() : data_parts(e);
+        std::vector<std::pair<std::string, const char*>> check = {{e.url, "VPK"}};
+        for (auto& p : parts)
+            check.push_back({p.first, "Архив data"});
+        if (enough_space(e, skip_data ? 1.2 : 2.1, err) && preflight(t, check, err) &&
+            fetch_checked(t, links(e.url, e.data.empty() ? e.mirror : ""), dl, e.sha256, "VPK", err)) {
             ok = install_vpk(t, dl, err);
             sceIoRemove(dl.c_str());
-            std::vector<std::string> parts = split(e.data, ';');
+            std::vector<std::string> recorded;
             for (size_t i = 0; ok && i < parts.size(); i++) {
-                std::string src = parts[i], dest = e.data_path;
-                size_t gt = src.find('>');
-                if (gt != std::string::npos) {
-                    dest = trim(src.substr(gt + 1));
-                    src = trim(src.substr(0, gt));
-                }
                 std::string dd = dl + "_data" + std::to_string(i);
-                ok = download(t, links(src, i == 0 ? e.mirror : ""), dd, err) && install_data(t, dd, dest, err);
+                ok = fetch_checked(t, links(parts[i].first, i == 0 ? e.mirror : ""), dd, "", "архив data", err) &&
+                     install_data(t, dd, parts[i].second, err);
+                if (ok) {
+                    std::vector<std::string> names;
+                    std::string lerr;
+                    if (zip_list(dd, names, lerr)) {
+                        auto tops = top_paths(names, parts[i].second);
+                        recorded.insert(recorded.end(), tops.begin(), tops.end());
+                    }
+                }
                 sceIoRemove(dd.c_str());
+            }
+            if (ok && !parts.empty())
+                data_record(e, recorded);
+            if (ok && skip_data) {
+                std::lock_guard<Mutex> lock(t.m);
+                if (t.note.empty())
+                    t.note = "Обновлён только VPK, data уже стоит";
             }
         }
     } else if (e.cat == CAT_TRANSLATIONS) {
@@ -565,12 +824,13 @@ void Tasks::run(Task& t)
                 err = "Нет ссылки на перевод";
             for (size_t i = 0; i < parts.size() && ok; i++) {
                 std::string f = dl + "_" + std::to_string(i);
-                ok = download(t, links(parts[i], i == 0 ? e.mirror : ""), f, err) && install_translation(t, f, err);
+                ok = fetch_checked(t, links(parts[i], i == 0 ? e.mirror : ""), f, parts.size() == 1 ? e.sha256 : "", "архив перевода", err) &&
+                     install_translation(t, f, err);
                 sceIoRemove(f.c_str());
             }
         }
     } else if (e.cat == CAT_PLUGINS) {
-        if (download(t, links(e.url, e.mirror), dl, err)) {
+        if (fetch_checked(t, links(e.url, e.mirror), dl, e.sha256, "плагин", err)) {
             ok = install_plugin_files(t, e, dl, e.tai_section, err);
             sceIoRemove(dl.c_str());
         }

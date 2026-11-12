@@ -83,6 +83,11 @@ struct App {
     Settings settings;
     Catalog catalog;
     Installed installed;
+    bool is_update_of(const Entry& e)
+    {
+        std::string v = installed.version_of(e);
+        return !v.empty() && v != (e.version.empty() ? "-" : e.version);
+    }
     Tasks tasks;
     Images images;
 
@@ -1187,6 +1192,10 @@ void App::ask_install(const Entry& e, bool reinstall)
     case CAT_HOMEBREW:
         if (e.data.empty())
             modal.lines.push_back("Будет установлен vpk, data не требуется");
+        else if (is_update_of(e) && data_installed(e, false))
+            modal.lines.push_back("Обновится только vpk, data уже стоит и не меняется");
+        else if (is_update_of(e))
+            modal.lines.push_back("Обновится vpk, data проверю и докачаю, только если она поменялась");
         else
             modal.lines.push_back("Будет установлен vpk и data в " + (e.data_path.empty() ? std::string("ux0:data") : e.data_path));
         break;
@@ -2459,7 +2468,7 @@ void App::queue_background(const Entry& e)
             urls.push_back(first_link(part));
     } else {
         urls.push_back(first_link(e.url));
-        if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW)
+        if ((e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW) && !is_update_of(e))
             for (auto& part : split_by(e.data, ';')) {
                 std::string src = part;
                 size_t gt = src.find('>');
@@ -3087,7 +3096,7 @@ void App::draw_preload()
         } else {
             int ut = std::max(1, p.unpack_total.load()), ud = std::min(p.unpacked.load(), ut);
             float f = (float)ud / ut;
-            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Подготавливаю архив");
+            gfx::text_center(gfx::regular, W / 2, 250, 15, col::MUTED, "Читаю оглавление пакета картинок, без распаковки");
             gfx::rrect(bx, by, bw, 18, 9, col::SURFACE2);
             if (f > 0)
                 gfx::rrect(bx, by, std::max(18.0f, bw * f), 18, 9, col::ACCENT2);

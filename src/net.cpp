@@ -258,6 +258,49 @@ static void release(CURL* h, Session* s)
         curl_easy_cleanup(h);
 }
 
+bool get_range(const std::string& url, const std::string& range, std::string& out, std::string& err)
+{
+    if (is_drive(url)) {
+        err = "range";
+        return false;
+    }
+    bool plain = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        Ctx ctx;
+        ctx.plain = plain;
+        out.clear();
+        CURL* h = nullptr;
+        ctx.sink = [&](const uint8_t* d, size_t n) {
+            long c = 0;
+            curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &c);
+            if (c != 206)
+                return false;
+            out.append((const char*)d, n);
+            return out.size() <= 16u * 1024 * 1024;
+        };
+        h = make(url, ctx);
+        curl_easy_setopt(h, CURLOPT_RANGE, range.c_str());
+        CURLcode rc = curl_easy_perform(h);
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (rc != CURLE_OK && tls_refused(rc) && !plain && starts_with(url, "https://")) {
+            release(h, nullptr);
+            plain = true;
+            attempt--;
+            continue;
+        }
+        if (rc != CURLE_OK || code != 206) {
+            err = code >= 400 ? "http " + std::to_string(code) : rc != CURLE_OK ? curl_err(h, rc) : "range " + std::to_string(code);
+            release(h, nullptr);
+            return false;
+        }
+        release(h, nullptr);
+        return true;
+    }
+    err = "range";
+    return false;
+}
+
 bool get(const std::string& url, std::string& out, std::string& err, Session* s)
 {
     std::string target = url;

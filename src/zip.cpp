@@ -404,7 +404,122 @@ bool zip_extract(const std::string& path, const std::string& dest, net::Progress
                 p->done = done;
         }
         sceIoClose(f);
-        unzCloseCurrentFile(z);
+        int closed = unzCloseCurrentFile(z);
+        if (ok && closed == UNZ_CRCERROR) {
+            err = "Архив повреждён, не сошлась контрольная сумма: " + name;
+            ok = false;
+        }
         return ok;
     });
+}
+
+bool zip_test(const std::string& path, net::Progress* p, std::string& err)
+{
+    if (!is_zip_file(path)) {
+        std::vector<std::string> names;
+        return tar_list(path, names, err);
+    }
+    uint64_t total = 0;
+    if (!each(path, err, [&](unzFile, const std::string&, const unz_file_info64& i) {
+            total += i.uncompressed_size;
+            return true;
+        }))
+        return false;
+    if (p) {
+        p->total = total;
+        p->done = 0;
+    }
+    std::vector<uint8_t> buf(256 * 1024);
+    uint64_t done = 0;
+    return each(path, err, [&](unzFile z, const std::string& name, const unz_file_info64& info) {
+        if (p && p->cancel) {
+            err = "Отменено";
+            return false;
+        }
+        if (ends_with(name, "/"))
+            return true;
+        if (unzOpenCurrentFile(z) != UNZ_OK) {
+            err = "Архив повреждён: " + name;
+            return false;
+        }
+        uint64_t got = 0;
+        for (;;) {
+            int r = unzReadCurrentFile(z, buf.data(), buf.size());
+            if (r < 0) {
+                unzCloseCurrentFile(z);
+                err = "Архив повреждён: " + name;
+                return false;
+            }
+            if (r == 0)
+                break;
+            got += r;
+            done += r;
+            if (p)
+                p->done = done;
+        }
+        if (unzCloseCurrentFile(z) == UNZ_CRCERROR || got != info.uncompressed_size) {
+            err = "Архив повреждён, не сошлась контрольная сумма: " + name;
+            return false;
+        }
+        return true;
+    });
+}
+
+static uint32_t le32(const std::string& b, size_t o)
+{
+    return (uint8_t)b[o] | ((uint8_t)b[o + 1] << 8) | ((uint8_t)b[o + 2] << 16) | ((uint32_t)(uint8_t)b[o + 3] << 24);
+}
+
+static uint16_t le16(const std::string& b, size_t o)
+{
+    return (uint8_t)b[o] | ((uint8_t)b[o + 1] << 8);
+}
+
+static uint64_t le64(const std::string& b, size_t o)
+{
+    return (uint64_t)le32(b, o) | ((uint64_t)le32(b, o + 4) << 32);
+}
+
+bool zip_remote_names(const std::string& url, std::vector<std::string>& names, std::string& err)
+{
+    std::string tail;
+    if (!net::get_range(url, "-65557", tail, err) || tail.size() < 22)
+        return false;
+    size_t eocd = std::string::npos;
+    for (size_t i = tail.size() - 22 + 1; i-- > 0;) {
+        if (le32(tail, i) == 0x06054b50) {
+            eocd = i;
+            break;
+        }
+    }
+    if (eocd == std::string::npos) {
+        err = "Не zip";
+        return false;
+    }
+    uint64_t cd_size = le32(tail, eocd + 12);
+    uint64_t cd_off = le32(tail, eocd + 16);
+    if (eocd >= 20 && le32(tail, eocd - 20) == 0x07064b50) {
+        uint64_t z64 = le64(tail, eocd - 12);
+        std::string rec;
+        if (!net::get_range(url, std::to_string(z64) + "-" + std::to_string(z64 + 55), rec, err) || rec.size() < 56 ||
+            le32(rec, 0) != 0x06064b50)
+            return false;
+        cd_size = le64(rec, 40);
+        cd_off = le64(rec, 48);
+    }
+    if (!cd_size || cd_size > 16u * 1024 * 1024) {
+        err = "Оглавление архива слишком большое";
+        return false;
+    }
+    std::string cd;
+    if (!net::get_range(url, std::to_string(cd_off) + "-" + std::to_string(cd_off + cd_size - 1), cd, err) || cd.size() < cd_size)
+        return false;
+    for (size_t p = 0; p + 46 <= cd.size() && le32(cd, p) == 0x02014b50;) {
+        uint16_t nlen = le16(cd, p + 28), xlen = le16(cd, p + 30), clen = le16(cd, p + 32);
+        if (p + 46 + nlen > cd.size())
+            break;
+        names.push_back(cd.substr(p + 46, nlen));
+        p += 46 + nlen + xlen + clen;
+    }
+    return !names.empty();
 }

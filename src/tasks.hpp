@@ -58,6 +58,7 @@ private:
 
 std::string tai_dir();
 std::string bg_file(const std::string& url);
+bool data_installed(const Entry& e, bool probe);
 std::string first_link(const std::string& primary);
 bool plugin_present(const Entry& plugin);
 bool tai_add_plugin(const std::string& section, const std::string& path, std::string& err);
