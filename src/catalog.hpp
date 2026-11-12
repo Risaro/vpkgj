@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-enum Category { CAT_GAMES, CAT_PORTS, CAT_TRANSLATIONS, CAT_HOMEBREW, CAT_PLUGINS, CAT_COUNT };
+enum Category { CAT_GAMES, CAT_PORTS, CAT_TRANSLATIONS, CAT_HOMEBREW, CAT_PLUGINS, CAT_ANDROID, CAT_COUNT };
 
 struct Entry {
     Category cat;
@@ -32,6 +32,7 @@ struct Entry {
     std::string needs;
     std::string alt_url;
     std::string alt_version;
+    std::string profile;
     std::string alt_source;
     std::string check;
     bool dlc = false;

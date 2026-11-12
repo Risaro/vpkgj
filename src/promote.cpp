@@ -77,6 +77,45 @@ bool sfo_get(const std::string& path, const std::string& key, std::string& out)
     return false;
 }
 
+bool sfo_set(const std::string& path, const std::string& key, const std::string& value)
+{
+    std::string data;
+    if (!fs::read(path, data) || data.size() < 20)
+        return false;
+    uint8_t* d = (uint8_t*)&data[0];
+    if (le32(d) != 0x46535000)
+        return false;
+    uint32_t keys = le32(d + 8);
+    uint32_t vals = le32(d + 12);
+    uint32_t count = le32(d + 16);
+    for (uint32_t i = 0; i < count; i++) {
+        uint8_t* e = d + 20 + i * 16;
+        if ((size_t)(e + 16 - d) > data.size())
+            return false;
+        uint32_t ko = keys + le16(e);
+        uint32_t max = le32(e + 8);
+        uint32_t vo = vals + le32(e + 12);
+        if (ko >= data.size() || vo + max > data.size())
+            return false;
+        if (key != (const char*)d + ko)
+            continue;
+        if (max == 0)
+            return false;
+        size_t n = value.size() < max - 1 ? value.size() : max - 1;
+        while (n > 0 && n < value.size() && ((unsigned char)value[n] & 0xC0) == 0x80)
+            n--;
+        memset(d + vo, 0, max);
+        memcpy(d + vo, value.data(), n);
+        uint32_t len = (uint32_t)n + 1;
+        e[4] = len & 0xFF;
+        e[5] = (len >> 8) & 0xFF;
+        e[6] = (len >> 16) & 0xFF;
+        e[7] = (len >> 24) & 0xFF;
+        return fs::write(path, data);
+    }
+    return false;
+}
+
 static void fpkg_hmac(const uint8_t* data, size_t len, uint8_t out[16])
 {
     uint8_t sha[20];

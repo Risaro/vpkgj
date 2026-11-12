@@ -37,7 +37,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "2.0"
+#define VPKGJ_VERSION "2.1"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -292,7 +292,7 @@ struct App {
 
 static bool launchable(const Entry& e)
 {
-    return e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || (e.cat == CAT_GAMES && !e.dlc);
+    return e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_ANDROID || (e.cat == CAT_GAMES && !e.dlc);
 }
 
 static uint32_t read_buttons()
@@ -339,6 +339,7 @@ static const std::vector<int>& sorts_for(int c)
         {S_CATALOG, S_NAME, S_GAME, S_NEW, S_BIG, S_SMALL},
         {S_CATALOG, S_NAME, S_AUTHOR, S_NEW, S_BIG, S_SMALL},
         {S_CATALOG, S_NAME, S_SECTION, S_AUTHOR},
+        {S_CATALOG, S_NAME, S_AUTHOR, S_NEW, S_BIG, S_SMALL},
     };
     return v[c];
 }
@@ -351,6 +352,7 @@ static const std::vector<int>& filters_for(int c)
         {F_GAME_HERE, F_INSTALLED, F_UPDATES},
         {F_RU, F_INSTALLED, F_UPDATES},
         {F_INSTALLED, F_UPDATES},
+        {F_RU, F_INSTALLED, F_UPDATES},
     };
     return v[c];
 }
@@ -1208,6 +1210,13 @@ void App::ask_install(const Entry& e, bool reinstall)
     case CAT_GAMES:
         modal.lines.push_back("PKG будет скачан и установлен, нужен NoNpDrm");
         break;
+    case CAT_ANDROID:
+        if (e.url.empty())
+            modal.lines.push_back("Нужен свой APK: ux0:data/vloader/" + e.id + "/game.apk");
+        else
+            modal.lines.push_back("APK скачается, из него возьмутся библиотеки и ресурсы игры");
+        modal.lines.push_back("Файлы лягут в ux0:data/vloader/" + e.id + ", появится пузырь на базе VLoader");
+        break;
     case CAT_TRANSLATIONS:
         if (!fs::exists("ux0:app/" + e.id))
             modal.lines.push_back("Игра " + e.id + " не найдена на консоли");
@@ -1603,7 +1612,7 @@ void App::input()
             primary_action();
         if ((pressed & SCE_CTRL_TRIANGLE) && detail.cat == CAT_GAMES)
             background_download(detail);
-        else if ((pressed & SCE_CTRL_TRIANGLE) && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
+        else if ((pressed & SCE_CTRL_TRIANGLE) && detail.cat != CAT_ANDROID && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
             queue_background(detail);
         if ((pressed & SCE_CTRL_LTRIGGER) && !detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0)
             ask_alt(detail);
@@ -1715,11 +1724,11 @@ void App::draw_header()
             label += " " + std::to_string(filtered[t].size());
         int n = t == TAB_DOWNLOADS ? tasks.active() + (int)bg_items.size() : t == TAB_UPDATES ? updates_count : 0;
         int tw = gfx::width(gfx::bold, 15, label);
-        float w = tw + 28 + (n ? 26 : 0);
+        float w = tw + 22 + (n ? 26 : 0);
         bool on = t == tab;
         if (on)
             gfx::rrect(x, 16, w, 34, 17, col::ACCENT);
-        gfx::text(on ? gfx::bold : gfx::regular, x + 14, 38, 15, on ? col::TEXT : col::MUTED, label);
+        gfx::text(on ? gfx::bold : gfx::regular, x + 11, 38, 15, on ? col::TEXT : col::MUTED, label);
         if (n) {
             std::string c = std::to_string(n);
             gfx::circle(x + w - 22, 33, 9, on ? col::TEXT : col::ACCENT);
@@ -1730,7 +1739,7 @@ void App::draw_header()
                             set_tab(tt);
                             screen = SCR_BROWSE;
                         }});
-        x += w + 4;
+        x += w + 2;
     }
     gfx::button(BTN_R, x + 6, 23, 20);
     if (refreshing == 1)
@@ -2067,6 +2076,13 @@ void App::draw_detail()
             chip("Нужны свои файлы игры: " + e.data_path, col::ORANGE);
         else
             chip("Data не нужна", col::TEXT);
+    }
+    if (e.cat == CAT_ANDROID) {
+        chip("Android, запуск через VLoader", col::TEXT);
+        if (e.url.empty())
+            chip("Нужен свой APK: ux0:data/vloader/" + e.id + "/game.apk", col::ORANGE);
+        else
+            chip("APK скачается и распакуется сам", col::GREEN);
     }
     if (e.cat == CAT_TRANSLATIONS && lower(e.install).find("plugin") != std::string::npos)
         chip("Нужен плагин, ставится сам", col::TEXT);
@@ -3436,7 +3452,7 @@ void App::draw_footer()
         x = gfx::hint(x, y, ok_icon, ok);
         if (st != ST_NONE && !busy)
             x = gfx::hint(x, y, BTN_SQUARE, "Переустановить");
-        if (!busy && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
+        if (!busy && detail.cat != CAT_ANDROID && !(detail.cat == CAT_PLUGINS && detail.url.empty()))
             x = gfx::hint(x, y, BTN_TRIANGLE, "В фоне");
         if (!detail.alt_url.empty() && version_cmp(detail.version, detail.alt_version) < 0 && !busy)
             x = gfx::hint(x, y, BTN_L, "Версия " + detail.alt_version);

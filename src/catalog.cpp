@@ -14,13 +14,13 @@
 
 const char* category_key(Category c)
 {
-    static const char* keys[] = {"games", "ports", "translations", "homebrew", "plugins"};
+    static const char* keys[] = {"games", "ports", "translations", "homebrew", "plugins", "android"};
     return keys[c];
 }
 
 const char* category_title(Category c)
 {
-    static const char* titles[] = {"Игры", "Порты", "Переводы", "Хоумбрю", "Плагины"};
+    static const char* titles[] = {"Игры", "Порты", "Переводы", "Хоумбрю", "Плагины", "Android"};
     return titles[c];
 }
 
@@ -127,7 +127,8 @@ bool Catalog::parse(const std::string& json, std::string& err)
             e.game_version = str(v, "game_version");
             e.install = str(v, "install");
             e.tai_section = str(v, "tai_section");
-            e.url = c == CAT_PORTS || c == CAT_HOMEBREW ? str(v, "vpk") : c == CAT_GAMES ? str(v, "pkg") : str(v, "url");
+            e.url = c == CAT_PORTS || c == CAT_HOMEBREW ? str(v, "vpk") : c == CAT_GAMES ? str(v, "pkg") : c == CAT_ANDROID ? str(v, "apk") : str(v, "url");
+            e.profile = str(v, "profile");
             e.data = str(v, "data");
             e.data_path = str(v, "data_path");
             e.mirror = str(v, "mirror");
@@ -148,6 +149,8 @@ bool Catalog::parse(const std::string& json, std::string& err)
             size_t nl;
             while ((nl = e.description.find("\\n")) != std::string::npos)
                 e.description.replace(nl, 2, "\n");
+            while ((nl = e.profile.find("\\n")) != std::string::npos)
+                e.profile.replace(nl, 2, "\n");
             e.search = lower(e.name + " " + e.id + " " + e.author);
             e.sort_name = lower(e.name);
             e.date = str(v, "date");
@@ -550,7 +553,7 @@ Status Installed::status(const Entry& e)
         std::string p = e.content.size() >= 36 ? "ux0:addcont/" + e.id + "/" + e.content.substr(20, 16) : "";
         return !p.empty() && app_exists("dlc:" + p) ? ST_INSTALLED : ST_NONE;
     }
-    if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_GAMES) {
+    if (e.cat == CAT_PORTS || e.cat == CAT_HOMEBREW || e.cat == CAT_GAMES || e.cat == CAT_ANDROID) {
         if (!app_exists(e.id))
             return ST_NONE;
         if (e.cat == CAT_GAMES)

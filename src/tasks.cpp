@@ -602,6 +602,107 @@ static bool install_data(Task& t, const std::string& file, const std::string& de
     return zip_extract(file, d, &t.progress, err);
 }
 
+static const char* VLOADER_VPK = "https://github.com/Risaro/vloader/releases/latest/download/VLoader.vpk";
+
+static bool android_unpack(Task& t, const std::string& apk, const std::string& dir, std::string& err)
+{
+    t.set_stage("Распаковка APK");
+    bool any = false;
+    bool ok = zip_extract(apk, dir, &t.progress, err, [&](const std::string& n) {
+        if (starts_with(n, "lib/armeabi-v7a/") && ends_with(n, ".so")) {
+            any = true;
+            return dir + "/" + n.substr(16);
+        }
+        if (starts_with(n, "assets/") && n.find("..") == std::string::npos)
+            return dir + "/" + n;
+        return std::string();
+    });
+    if (ok && !any) {
+        err = "В APK нет библиотек armeabi-v7a, эта версия игры не подойдёт";
+        return false;
+    }
+    return ok;
+}
+
+static std::string profile_value(const std::string& profile, const std::string& key)
+{
+    for (auto& line : split(profile, '\n')) {
+        std::string l = trim(line);
+        size_t eq = l.find('=');
+        if (eq != std::string::npos && l[0] != '#' && trim(l.substr(0, eq)) == key)
+            return trim(l.substr(eq + 1));
+    }
+    return "";
+}
+
+static bool install_android(Task& t, const std::string& dl, std::string& err)
+{
+    const Entry& e = t.entry;
+    std::string dir = "ux0:data/vloader/" + e.id;
+    std::string so = profile_value(e.profile, "so");
+    if (e.profile.empty() || so.empty()) {
+        err = "У записи нет профиля игры";
+        return false;
+    }
+    fs::mkdirs(dir);
+    std::string own = dir + "/game.apk";
+    if (!e.url.empty()) {
+        if (!fetch_checked(t, links(e.url, e.mirror), dl, e.sha256, "APK", err))
+            return false;
+        bool ok = android_unpack(t, dl, dir, err);
+        sceIoRemove(dl.c_str());
+        if (!ok)
+            return false;
+    } else if (fs::exists(own)) {
+        if (!android_unpack(t, own, dir, err))
+            return false;
+    } else if (!fs::exists(dir + "/" + so)) {
+        err = "Нужен свой APK игры: положи его как " + own + " и нажми «Установить» ещё раз";
+        return false;
+    }
+    if (!fs::exists(dir + "/" + so)) {
+        err = "В APK нет " + so + ", профиль не подходит к этой версии игры";
+        return false;
+    }
+    auto parts = data_parts(e);
+    for (size_t i = 0; i < parts.size(); i++) {
+        std::string dd = dl + "_data" + std::to_string(i);
+        std::string dest = parts[i].second == "ux0:data" ? dir : parts[i].second;
+        bool ok = fetch_checked(t, links(parts[i].first, ""), dd, "", "архив data", err) && install_data(t, dd, dest, err);
+        sceIoRemove(dd.c_str());
+        if (!ok)
+            return false;
+    }
+    if (!fs::write(dir + "/profile.txt", e.profile)) {
+        err = "Не удалось записать профиль в " + dir;
+        return false;
+    }
+    std::string vpk = APP_DIR + "/dl/vloader.vpk";
+    t.set_stage("Скачиваю VLoader");
+    if (!download(t, {VLOADER_VPK}, vpk, err)) {
+        err = "VLoader: " + err;
+        return false;
+    }
+    std::string app = TEMP + "/app";
+    fs::rmtree(app);
+    fs::mkdirs(app);
+    t.set_stage("Сборка пузыря");
+    bool ok = zip_extract(vpk, app, &t.progress, err);
+    sceIoRemove(vpk.c_str());
+    if (ok) {
+        std::string sfo = app + "/sce_sys/param.sfo";
+        ok = sfo_set(sfo, "TITLE_ID", e.id) && sfo_set(sfo, "TITLE", e.name) && sfo_set(sfo, "STITLE", e.name);
+        if (!ok)
+            err = "Не удалось прописать название игры в param.sfo";
+    }
+    if (ok) {
+        t.set_stage("Установка");
+        ok = promote_app(app, err);
+    }
+    fs::rmtree(app);
+    return ok;
+}
+
 static bool enough_space(const Entry& e, double factor, std::string& err)
 {
     if (!e.size)
@@ -851,6 +952,9 @@ void Tasks::run(Task& t)
                     t.note = "Обновлён только VPK, data уже стоит";
             }
         }
+    } else if (e.cat == CAT_ANDROID) {
+        if (enough_space(e, 2.2, err))
+            ok = install_android(t, dl, err);
     } else if (e.cat == CAT_TRANSLATIONS) {
         if (enough_space(e, 2.1, err)) {
             std::vector<std::string> parts;
