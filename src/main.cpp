@@ -36,7 +36,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.6"
+#define VPKGJ_VERSION "1.7"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
