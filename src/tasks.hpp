@@ -29,6 +29,7 @@ struct Task {
     bool staged = false;
     bool notified = false;
     bool synced = false;
+    bool shaccg = false;
 
     std::string get_stage();
     std::string get_error();

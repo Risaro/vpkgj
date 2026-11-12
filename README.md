@@ -16,6 +16,8 @@
 - Быстрые картинки: превью уменьшаются под размер карточки, видимое грузится первым, соседние ряды подгружаются заранее, соединения переиспользуются.
 - Обновления: при запуске VPKGJ сравнивает установленное с каталогом и патчи игр со списком `url_updates` из конфига pkgj, присылает системное уведомление и даёт обновить всё одной кнопкой во вкладке Загрузки.
 - Фоновая проверка (Настройки): демон `vpkgj_daemon.suprx` в `*main` раз в 6 часов проверяет обновления, даже когда приложение закрыто, и показывает уведомление на LiveArea. Работает на 3.60 и 3.65.
+- libshacccg.suprx ставится сам: если его нет или на его месте папка, VPKGJ при запуске убирает папку, ставит ShaRKF00D и PSM Runtime, достаёт файл и возвращается обратно без участия пользователя.
+- Демон ничего не пишет на карту, пока Vita подключена к ПК по USB, фоновые загрузки продолжаются после отключения.
 - Зависимости: перед установкой перевода или порта проверяется, стоят ли нужные плагины (rePatch, kubridge, fd_fix и другие). Если нет, они ставятся сами.
 - Сетка карточек с обложками, карточка игры со скриншотами, описанием и размером.
 - Поиск по названию, titleid и автору.
@@ -93,4 +95,5 @@ GPL-3.0. Шрифт Inter, лицензия OFL (`assets/Inter-LICENSE.txt`).
 - Распаковка PKG, zRIF и системная фоновая загрузка по устройству [pkgj](https://github.com/blastrock/pkgj) (фоновая загрузка: dots-tb и команда NPS).
 - Обложки и описания игр: база [LaunchBox Games Database](https://gamesdb.launchbox-app.com).
 - Уведомления на LiveArea из демона по образцу VitaDB Downloader и [SceShell-Notice-PoC](https://github.com/Princess-of-Sleeping/SceShell-Notice-PoC).
+- Установка libshacccg.suprx через PSM Runtime и [ShaRKF00D](https://github.com/OsirizX/ShaRKF00D) по схеме [VitaDB Downloader](https://github.com/Rinnegatamante/VitaDB-Downloader) (Rinnegatamante, оверлей host0 по образцу CrystalPSM).
 - Генерация `head.bin` для установки vpk по образцу [VitaShell](https://github.com/TheOfficialFloW/VitaShell), VHBB и [VitaDB Downloader](https://github.com/Rinnegatamante/VitaDB-Downloader).

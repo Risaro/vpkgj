@@ -8,6 +8,7 @@
 #include "pkg.hpp"
 #include "promote.hpp"
 #include "tasks.hpp"
+#include "shaccg.hpp"
 #include "util.hpp"
 
 #include <psp2/apputil.h>
@@ -36,7 +37,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.7"
+#define VPKGJ_VERSION "1.8"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -128,6 +129,11 @@ struct App {
     void open_backups();
     void saves_menu(const Entry& e);
     void check_reboot();
+    Entry shaccg_entry();
+    void shaccg_ask();
+    void shaccg_go();
+    void shaccg_resume();
+    void quit_to(const std::function<void()>& launch);
     bool daemon_enabled();
     void daemon_notify(const std::string& text);
     void toggle_daemon();
@@ -1222,6 +1228,8 @@ void App::ask_install(const Entry& e, bool reinstall)
     for (auto& d : deps) {
         if (plugin_present(d))
             continue;
+        if (d.id == "libshacccg")
+            continue;
         if (d.url.empty())
             manual += (manual.empty() ? "" : ", ") + d.name;
         else
@@ -1231,12 +1239,21 @@ void App::ask_install(const Entry& e, bool reinstall)
         modal.lines.push_back("Сначала поставится: " + need);
     if (!manual.empty())
         modal.lines.push_back("Нужно поставить вручную: " + manual);
+    bool need_shaccg = false;
+    for (auto& d : deps)
+        if (d.id == "libshacccg" && shaccg::state() != shaccg::SH_OK)
+            need_shaccg = true;
     modal.yes = reinstall ? "Переустановить" : "Установить";
     Entry copy = e;
     modal.action = [this, copy, deps]() {
         tasks.add(copy, deps);
         show_toast("Добавлено в загрузки");
     };
+    if (need_shaccg) {
+        modal.lines.push_back("Без libshacccg.suprx порт вылетит, его можно поставить автоматически");
+        modal.alt = "Сначала libshacccg";
+        modal.alt_action = [this]() { shaccg_ask(); };
+    }
     if (e.cat == CAT_GAMES && !e.dlc) {
         std::vector<Entry> trs;
         for (auto& t : catalog.items[CAT_TRANSLATIONS])
@@ -1268,6 +1285,10 @@ void App::primary_action()
         modal.lines.push_back(e.name);
         modal.yes = "Отменить";
         modal.action = [t]() { t->progress.cancel = true; };
+        return;
+    }
+    if (e.cat == CAT_PLUGINS && e.id == "libshacccg") {
+        shaccg_ask();
         return;
     }
     if (e.cat == CAT_PLUGINS && e.url.empty()) {
@@ -2564,11 +2585,165 @@ void App::ask_app_update(bool manual)
     };
 }
 
+Entry App::shaccg_entry()
+{
+    Entry s;
+    for (auto& p : catalog.items[CAT_PLUGINS])
+        if (p.id == "libshacccg")
+            s = p;
+    s.cat = CAT_PLUGINS;
+    s.id = "libshacccg";
+    if (s.name.empty())
+        s.name = "libshacccg.suprx";
+    s.install = "shaccg";
+    s.url = "https://github.com/OsirizX/ShaRKF00D/releases/download/1.3/ShaRKF00D.vpk";
+    s.mirror.clear();
+    for (auto& h : catalog.items[CAT_HOMEBREW])
+        if (h.id == shaccg::SHARK_ID && !h.url.empty()) {
+            s.url = h.url;
+            s.mirror = h.mirror;
+        }
+    return s;
+}
+
+void App::shaccg_ask()
+{
+    shaccg::State st = shaccg::state();
+    if (st == shaccg::SH_OK) {
+        show_toast("libshacccg.suprx на месте, всё в порядке");
+        return;
+    }
+    modal = Modal();
+    modal.on = true;
+    modal.title = "Установка libshacccg.suprx";
+    if (st == shaccg::SH_DIR)
+        modal.lines.push_back("На месте ur0:data/libshacccg.suprx лежит папка, из-за неё вылетают порты. Удалю её.");
+    else
+        modal.lines.push_back("Компилятора шейдеров нет, без него порты и VitaDB вылетают.");
+    if (!shaccg::shark_installed())
+        modal.lines.push_back("Поставлю ShaRKF00D, он достаёт файл с самой консоли.");
+    if (!shaccg::psm_installed())
+        modal.lines.push_back("Скачаю PSM Runtime (16 МБ) и поставлю его системным установщиком.");
+    modal.lines.push_back("VPKGJ пару раз закроется и откроется сам, ничего не нажимай.");
+    modal.yes = "Начать";
+    Entry e = shaccg_entry();
+    modal.action = [this, e]() {
+        sceIoRemove((APP_DIR + "/shaccg_fail.txt").c_str());
+        tasks.add(e);
+        show_toast("Готовлю установку libshacccg");
+    };
+}
+
+void App::quit_to(const std::function<void()>& launch)
+{
+    tasks.stop();
+    images.stop();
+    promoter_fini();
+    net::fini();
+    launch();
+    sceKernelExitProcess(0);
+}
+
+void App::shaccg_go()
+{
+    std::string err;
+    if (shaccg::state() == shaccg::SH_OK) {
+        show_toast("libshacccg.suprx на месте, всё в порядке");
+        return;
+    }
+    backup_create("Перед установкой libshacccg: config.txt", {"ux0:tai/config.txt", "ur0:tai/config.txt"}, err);
+    err.clear();
+    if (!shaccg::arm(err)) {
+        show_toast(err);
+        return;
+    }
+    shaccg::reset_tries();
+    if (!shaccg::psm_installed()) {
+        if (!shaccg::load_kernel()) {
+            shaccg::disarm();
+            show_toast("Не загрузился помощник установки, перезагрузи консоль и повтори");
+            return;
+        }
+        log_line("shaccg: installing PSM runtime");
+        quit_to([]() { sceAppMgrLaunchAppByName(0x60000, "NPXS10031", "[BATCH]host0:/package/Runtime1.00.pkg\nhost0:/package/Runtime2.01.pkg"); });
+    }
+    shaccg::add_try();
+    log_line("shaccg: launching ShaRKF00D");
+    quit_to([]() { sceAppMgrLaunchAppByName(0x60000, shaccg::SHARK_ID, ""); });
+}
+
+void App::shaccg_resume()
+{
+    if (!shaccg::armed()) {
+        if (shaccg::state() != shaccg::SH_OK && !fs::exists(APP_DIR + "/shaccg_fail.txt")) {
+            log_line("shaccg: auto start, state %d", (int)shaccg::state());
+            tasks.add(shaccg_entry());
+            show_toast("Ставлю libshacccg.suprx, без него порты вылетают");
+        }
+        return;
+    }
+    if (shaccg::state() == shaccg::SH_OK) {
+        shaccg::disarm();
+        log_line("shaccg: done");
+        modal = Modal();
+        modal.on = true;
+        modal.title = "libshacccg.suprx установлен";
+        modal.lines.push_back("Компилятор шейдеров на месте, порты и VitaDB больше не будут вылетать.");
+        modal.yes = "Отлично";
+        modal.action = []() {};
+        return;
+    }
+    if (shaccg::psm_installed() && shaccg::shark_installed() && shaccg::tries() < 2) {
+        shaccg::add_try();
+        log_line("shaccg: resume, launching ShaRKF00D");
+        quit_to([]() { sceAppMgrLaunchAppByName(0x60000, shaccg::SHARK_ID, ""); });
+    }
+    shaccg::disarm();
+    fs::write(APP_DIR + "/shaccg_fail.txt", "1");
+    log_line("shaccg: failed, psm %d shark %d", shaccg::psm_installed(), shaccg::shark_installed());
+    modal = Modal();
+    modal.on = true;
+    modal.title = "libshacccg.suprx не поставился";
+    if (!shaccg::psm_installed())
+        modal.lines.push_back("PSM Runtime не установился.");
+    else if (!shaccg::shark_installed())
+        modal.lines.push_back("ShaRKF00D не найден.");
+    else
+        modal.lines.push_back("ShaRKF00D не смог достать файл.");
+    modal.lines.push_back("Перезагрузи консоль и попробуй ещё раз.");
+    modal.yes = "Повторить";
+    modal.action = [this]() { shaccg_ask(); };
+}
+
 void App::check_reboot()
 {
     if (modal.on)
         return;
     for (auto& t : tasks.list()) {
+        if (t->state == TS_DONE && t->shaccg && !t->notified) {
+            t->notified = true;
+            t->synced = true;
+            installed.refresh();
+            if (shaccg::state() == shaccg::SH_OK) {
+                show_toast("libshacccg.suprx на месте");
+                continue;
+            }
+            if (!tasks.active()) {
+                shaccg_go();
+                return;
+            }
+            modal = Modal();
+            modal.on = true;
+            modal.title = "Всё готово к установке";
+            modal.lines.push_back(shaccg::psm_installed() ? "Сейчас запустится ShaRKF00D и достанет файл."
+                                                          : "Сейчас откроется системный установщик PSM Runtime, потом ShaRKF00D.");
+            modal.lines.push_back("VPKGJ откроется сам, когда всё закончится.");
+            if (tasks.active())
+                modal.lines.push_back("Остальные загрузки продолжатся после перезапуска.");
+            modal.yes = "Продолжить";
+            modal.action = [this]() { shaccg_go(); };
+            return;
+        }
         if (t->state == TS_FAILED && !t->synced) {
             t->synced = true;
             daemon_notify("Не удалось установить: " + t->entry.name);
@@ -3428,6 +3603,7 @@ void App::run()
     }
     tasks.start(&installed);
     start_refresh(false);
+    shaccg_resume();
 
     for (;;) {
         apply_refresh();

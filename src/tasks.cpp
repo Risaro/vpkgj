@@ -4,6 +4,7 @@
 #include "images.hpp"
 #include "pkg.hpp"
 #include "promote.hpp"
+#include "shaccg.hpp"
 #include "util.hpp"
 #include "zip.hpp"
 
@@ -178,17 +179,6 @@ static bool fetch_checked(Task& t, const std::vector<std::string>& urls, const s
             if (lower(sha) != h) {
                 log_line("sha mismatch %s: %s", what, h.c_str());
                 err = std::string("Не прошла проверка: ") + what + " скачался битым, хеш не совпал" + FIX_SOON;
-                sceIoRemove(path.c_str());
-                continue;
-            }
-        }
-        if (is_zip(path)) {
-            t.set_stage(std::string("Проверка ") + what);
-            if (!zip_test(path, &t.progress, err)) {
-                if (t.progress.cancel)
-                    return false;
-                log_line("zip test %s: %s", what, err.c_str());
-                err = std::string("Не прошла проверка: ") + what + " битый. " + err + FIX_SOON;
                 sceIoRemove(path.c_str());
                 continue;
             }
@@ -538,7 +528,7 @@ bool plugin_present(const Entry& p)
     bool files_only = !keys.empty();
     for (auto& k : keys) {
         if (starts_with(k, "file:")) {
-            if (fs::exists(k.substr(5)))
+            if (fs::exists(k.substr(5)) && !fs::is_dir(k.substr(5)))
                 return true;
         } else {
             files_only = false;
@@ -717,6 +707,48 @@ static bool self_update(Task& t, const std::string& file, bool staged, std::stri
     return true;
 }
 
+static bool install_shaccg(Task& t, std::string& err)
+{
+    const Entry& e = t.entry;
+    if (shaccg::state() == shaccg::SH_DIR) {
+        t.set_stage("Убираю папку на месте libshacccg.suprx");
+        fs::rmtree("ur0:data/libshacccg.suprx");
+        if (fs::exists("ur0:data/libshacccg.suprx")) {
+            err = "Не удалось удалить папку ur0:data/libshacccg.suprx";
+            return false;
+        }
+    }
+    if (shaccg::state() == shaccg::SH_OK)
+        return true;
+    if (!shaccg::shark_installed()) {
+        std::string f = APP_DIR + "/dl/shark.vpk";
+        t.set_stage("Скачиваю ShaRKF00D");
+        bool ok = download(t, links(e.url, e.mirror), f, err) && install_vpk(t, f, err);
+        sceIoRemove(f.c_str());
+        if (!ok) {
+            err = "ShaRKF00D: " + err;
+            return false;
+        }
+    }
+    if (!shaccg::psm_installed()) {
+        const char* urls[2] = {
+            "https://archive.org/download/psm-runtime/IP9100-PCSI00011_00-PSMRUNTIME000000.pkg",
+            "https://archive.org/download/psm-runtime/IP9100-PCSI00011_00-PSMRUNTIME000000-A0201-V0100-e4708b1c1c71116c29632c23df590f68edbfc341-PE.pkg",
+        };
+        const char* dst[2] = {"ux0:data/Runtime1.00.pkg", "ux0:data/Runtime2.01.pkg"};
+        for (int i = 0; i < 2; i++) {
+            t.set_stage(std::string("Скачиваю PSM Runtime ") + (i ? "2.01" : "1.00"));
+            if (!download(t, {urls[i]}, dst[i], err)) {
+                err = "PSM Runtime: " + err;
+                return false;
+            }
+        }
+    }
+    std::lock_guard<Mutex> lock(t.m);
+    t.shaccg = true;
+    return true;
+}
+
 void Tasks::run(Task& t)
 {
     const Entry& e = t.entry;
@@ -732,6 +764,19 @@ void Tasks::run(Task& t)
             std::lock_guard<Mutex> lock(t.m);
             t.error = t.progress.cancel ? "Отменено" : err;
             t.state = t.progress.cancel ? TS_CANCELED : TS_FAILED;
+        }
+        return;
+    }
+    if (e.install == "shaccg") {
+        bool ok = install_shaccg(t, err);
+        std::lock_guard<Mutex> lock(t.m);
+        if (ok) {
+            t.stage = "Готово";
+            t.state = TS_DONE;
+        } else {
+            t.error = t.progress.cancel ? "Отменено" : err;
+            t.state = t.progress.cancel ? TS_CANCELED : TS_FAILED;
+            log_line("shaccg failed: %s", t.error.c_str());
         }
         return;
     }

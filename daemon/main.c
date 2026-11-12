@@ -9,6 +9,7 @@
 #include <psp2/net/net.h>
 #include <psp2/net/netctl.h>
 #include <psp2/sysmodule.h>
+#include <psp2/udcd.h>
 #include <taihen.h>
 #include <taipool.h>
 
@@ -405,6 +406,15 @@ static void dlog(const char* fmt, ...)
     append_file(DIR "/daemon.log", text, n);
 }
 
+static int usb_busy(void)
+{
+    SceUdcdDeviceState st;
+    sceClibMemset(&st, 0, sizeof(st));
+    if (sceUdcdGetDeviceState(&st) < 0)
+        return 0;
+    return ((st.state | st.connection) & SCE_UDCD_STATUS_CONNECTION_ESTABLISHED) != 0;
+}
+
 static unsigned long long beat_at;
 
 static void beat(void)
@@ -465,6 +475,11 @@ static int dl_head(int status, unsigned long long len)
 
 static int dl_sink(const char* d, int n)
 {
+    if (usb_busy()) {
+        while (usb_busy())
+            sceKernelDelayThread(1000 * 1000);
+        return 0;
+    }
     while (n > 0) {
         int k = CHUNK - dl_fill;
         if (k > n)
@@ -781,7 +796,17 @@ static int daemon_thread(SceSize args, void* argp)
     sceNetCtlInit();
     dlog("net ready, online %d", online());
     unsigned long long next_check = now_s() + 60;
+    int usb_was = 0;
     for (;;) {
+        if (usb_busy()) {
+            usb_was = 1;
+            sceKernelDelayThread(2 * 1000 * 1000);
+            continue;
+        }
+        if (usb_was) {
+            usb_was = 0;
+            dlog("usb mode ended, resume");
+        }
         beat();
         SceIoStat st;
         int off = sceIoGetstat(DIR "/daemon_off", &st) >= 0;

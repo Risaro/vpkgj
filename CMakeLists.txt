@@ -13,7 +13,7 @@ include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
 set(VITA_APP_NAME "VPKGJ")
 set(VITA_TITLEID "VPKG00001")
-set(VITA_VERSION "01.70")
+set(VITA_VERSION "01.80")
 set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d ATTRIBUTE2=12")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -33,6 +33,7 @@ add_executable(vpkgj
   src/net.cpp
   src/pkg.cpp
   src/promote.cpp
+  src/shaccg.cpp
   src/tasks.cpp
   src/util.cpp
   src/zip.cpp
@@ -107,10 +108,37 @@ target_link_libraries(vpkgj_daemon
   SceSysmodule_stub
   SceNet_stub_weak
   SceNetCtl_stub_weak
+  SceUdcd_stub_weak
   SceIofilemgr_stub
   SceLibc_stub_weak
 )
 set_target_properties(vpkgj_daemon PROPERTIES LINK_FLAGS "-nostdlib")
+add_executable(vpkgj_psm_kernel psm/kernel/main.c)
+target_link_libraries(vpkgj_psm_kernel
+  k
+  gcc
+  SceSysmemForDriver_stub
+  SceSysclibForDriver_stub
+  SceFios2KernelForDriver_stub
+  SceProcEventForDriver_stub
+  taihenForKernel_stub
+)
+set_target_properties(vpkgj_psm_kernel PROPERTIES LINK_FLAGS "-nostdlib")
+vita_create_self(vpkgj_psm.skprx vpkgj_psm_kernel UNSAFE CONFIG ${CMAKE_SOURCE_DIR}/psm/kernel/exports.yml)
+
+add_executable(vpkgj_psm_user psm/user/main.c)
+target_link_libraries(vpkgj_psm_user
+  taihen_stub
+  k
+  gcc
+  SceLibKernel_stub_weak
+  SceAppMgr_stub
+  SceLibc_stub_weak
+)
+set_target_properties(vpkgj_psm_user PROPERTIES LINK_FLAGS "-nostdlib")
+target_compile_options(vpkgj_psm_user PRIVATE -std=gnu11)
+vita_create_self(vpkgj_psm.suprx vpkgj_psm_user UNSAFE CONFIG ${CMAKE_SOURCE_DIR}/psm/user/exports.yml)
+
 vita_create_self(vpkgj_daemon.suprx vpkgj_daemon UNSAFE CONFIG ${CMAKE_SOURCE_DIR}/daemon/exports.yml)
 
 vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
@@ -125,6 +153,8 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
        assets/mascot.png assets/mascot.png
        assets/logo.png assets/logo.png
        ${CMAKE_BINARY_DIR}/vpkgj_daemon.suprx vpkgj_daemon.suprx
+       ${CMAKE_BINARY_DIR}/vpkgj_psm.skprx vpkgj_psm.skprx
+       ${CMAKE_BINARY_DIR}/vpkgj_psm.suprx vpkgj_psm.suprx
 )
 
 set(VPKGJ_COVERS "${CMAKE_SOURCE_DIR}/../db" CACHE PATH "vpkgj-db checkout with media/covers and covers.json")
