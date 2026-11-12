@@ -52,6 +52,7 @@ struct Settings {
     std::string games_url;
     std::string dlcs_url;
     std::string updates_url;
+    std::string extra;
     void load();
     void save() const;
     std::string base() const;

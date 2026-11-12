@@ -24,36 +24,59 @@ const char* category_title(Category c)
     return titles[c];
 }
 
+static const char* DEFAULT_GAMES_URL = "http://art-proshivka.ru/tsv/PSV_GAMES.tsv";
+static const char* DEFAULT_UPDATES_URL = "http://art-proshivka.ru/tsv/PSV_UPDATES.tsv";
+static const char* DEFAULT_DLCS_URL = "http://art-proshivka.ru/tsv/PSV_DLCS.tsv";
+static const char* DEFAULT_EXTRA = "url_psx_games http://art-proshivka.ru/tsv/PSX_GAMES.tsv\n"
+                                   "url_psp_games http://art-proshivka.ru/tsv/PSP_GAMES.tsv\n"
+                                   "#install_psp_as_pbp 1\n"
+                                   "#install_psx_psx_location ux0:\n";
+
 void Settings::load()
 {
     std::string s;
-    if (!fs::read(APP_DIR + "/config.txt", s))
-        return;
+    fs::read(APP_DIR + "/config.txt", s);
+    extra.clear();
     std::istringstream in(s);
     std::string line;
     while (std::getline(in, line)) {
-        size_t eq = line.find('=');
-        if (eq == std::string::npos)
+        line = trim(line);
+        if (line.empty())
             continue;
-        std::string k = trim(line.substr(0, eq));
-        std::string v = trim(line.substr(eq + 1));
-        if (k == "repo" && !v.empty())
-            repo = v;
-        else if (k == "branch" && !v.empty())
-            branch = v;
-        else if (k == "url_games")
+        size_t sep = line.find_first_of("= \t");
+        std::string k = line.substr(0, sep);
+        std::string v = sep == std::string::npos ? "" : trim(line.substr(sep + 1));
+        if (!v.empty() && v[0] == '=')
+            v = trim(v.substr(1));
+        if (k == "repo") {
+            if (!v.empty())
+                repo = v;
+        } else if (k == "branch") {
+            if (!v.empty())
+                branch = v;
+        } else if (k == "url_games")
             games_url = v;
         else if (k == "url_dlcs")
             dlcs_url = v;
         else if (k == "url_updates")
             updates_url = v;
+        else
+            extra += line + "\n";
+    }
+    if (games_url.empty() && dlcs_url.empty() && updates_url.empty()) {
+        games_url = DEFAULT_GAMES_URL;
+        updates_url = DEFAULT_UPDATES_URL;
+        dlcs_url = DEFAULT_DLCS_URL;
+        if (extra.empty())
+            extra = DEFAULT_EXTRA;
+        save();
     }
 }
 
 void Settings::save() const
 {
-    fs::write(APP_DIR + "/config.txt", "repo=" + repo + "\nbranch=" + branch + "\nurl_games=" + games_url + "\nurl_dlcs=" + dlcs_url +
-                                           "\nurl_updates=" + updates_url + "\n");
+    fs::write(APP_DIR + "/config.txt", "repo=" + repo + "\nbranch=" + branch + "\nurl_games " + games_url + "\nurl_updates " + updates_url +
+                                           "\nurl_dlcs " + dlcs_url + "\n" + extra);
 }
 
 std::string Settings::base() const

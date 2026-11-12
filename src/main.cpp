@@ -37,7 +37,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.9"
+#define VPKGJ_VERSION "2.0"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -3148,7 +3148,7 @@ void App::draw_settings()
              modal.lines.push_back("Ссылки на tsv в формате pkgj, pkgj для этого не нужен.");
              modal.lines.push_back("Игры: " + (settings.games_url.empty() ? std::string("не задано") : settings.games_url));
              modal.lines.push_back("DLC: " + (settings.dlcs_url.empty() ? std::string("не задано") : settings.dlcs_url));
-             modal.lines.push_back("Можно вписать и в ux0:data/VPKGJ/config.txt: url_games=, url_dlcs=, url_updates=");
+             modal.lines.push_back("Можно вписать и в ux0:data/VPKGJ/config.txt: url_games, url_dlcs, url_updates");
              modal.yes = "Ссылка на игры";
              modal.action = [this]() {
                  ime_purpose = IME_GAMES;
