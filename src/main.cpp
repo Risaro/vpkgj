@@ -37,7 +37,7 @@
 #include <set>
 #include <sstream>
 
-#define VPKGJ_VERSION "1.8"
+#define VPKGJ_VERSION "1.9"
 #define VPKGJ_AUTHOR "Risaro"
 #define VPKGJ_TG "t.me/lik1sa"
 #define VPKGJ_FOR "phc.lokilab.ru"
@@ -63,7 +63,7 @@ static const int TAB_DOWNLOADS = CAT_COUNT + 1;
 static const int TAB_COUNT = CAT_COUNT + 2;
 
 enum Screen { SCR_BROWSE, SCR_DETAIL, SCR_SETTINGS, SCR_BACKUPS, SCR_PRELOAD };
-enum ImePurpose { IME_NONE, IME_SEARCH, IME_REPO, IME_BRANCH };
+enum ImePurpose { IME_NONE, IME_SEARCH, IME_REPO, IME_BRANCH, IME_GAMES, IME_DLCS };
 
 struct Hit {
     float x, y, w, h;
@@ -1343,6 +1343,14 @@ void App::ime_done(const std::string& text)
             start_refresh(true);
         }
         break;
+    case IME_GAMES:
+    case IME_DLCS:
+        (ime_purpose == IME_GAMES ? settings.games_url : settings.dlcs_url) = trim(text);
+        settings.save();
+        sceIoRemove((APP_DIR + (ime_purpose == IME_GAMES ? "/pkgj_games.tsv" : "/pkgj_dlcs.tsv")).c_str());
+        start_refresh(true);
+        show_toast(trim(text).empty() ? "Ссылка убрана" : "Ссылка сохранена, обновляю список");
+        break;
     default:
         break;
     }
@@ -1675,7 +1683,7 @@ void App::input()
             screen = SCR_BROWSE;
             return;
         }
-        if (settings_sel == 4 && (act & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))) {
+        if (settings_sel == 5 && (act & (SCE_CTRL_LEFT | SCE_CTRL_RIGHT))) {
             speed_mode = (speed_mode + ((act & SCE_CTRL_LEFT) ? 4 : 1)) % 5;
             save_prefs();
             apply_speed();
@@ -1827,6 +1835,10 @@ void App::draw_grid()
             gfx::text_center(gfx::bold, W / 2, cy, 20, col::TEXT, "Не удалось загрузить каталог");
             gfx::text_center(gfx::regular, W / 2, cy + 28, 15, col::MUTED, gfx::ellipsize(gfx::regular, 15, refresh_err, 700));
             gfx::text_center(gfx::regular, W / 2, cy + 52, 15, col::MUTED, settings.repo + " · " + settings.branch);
+        } else if (tab == CAT_GAMES) {
+            gfx::text_center(gfx::bold, W / 2, cy, 20, col::TEXT, "Нет списка игр");
+            gfx::text_center(gfx::regular, W / 2, cy + 28, 15, col::MUTED, "Укажи ссылки в Настройки → Списки игр и DLC");
+            gfx::text_center(gfx::regular, W / 2, cy + 52, 15, col::MUTED, "pkgj для этого не нужен");
         } else {
             gfx::text_center(gfx::bold, W / 2, cy, 20, col::TEXT, "Здесь пока пусто");
             gfx::text_center(gfx::regular, W / 2, cy + 28, 15, col::MUTED, "Записи появятся, когда их добавят в каталог");
@@ -3126,6 +3138,28 @@ void App::draw_settings()
              ime_purpose = IME_BRANCH;
              ime::open("Ветка", settings.branch, 60);
          }},
+        {"Списки игр и DLC", settings.games_url.empty() && settings.dlcs_url.empty()
+                                 ? (pkgj_config_path().empty() ? "не заданы" : "из pkgj")
+                                 : "свои, игр " + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
+         settings.games_url.empty() && pkgj_config_path().empty() ? col::ORANGE : col::MUTED, [this]() {
+             modal = Modal();
+             modal.on = true;
+             modal.title = "Списки игр и DLC";
+             modal.lines.push_back("Ссылки на tsv в формате pkgj, pkgj для этого не нужен.");
+             modal.lines.push_back("Игры: " + (settings.games_url.empty() ? std::string("не задано") : settings.games_url));
+             modal.lines.push_back("DLC: " + (settings.dlcs_url.empty() ? std::string("не задано") : settings.dlcs_url));
+             modal.lines.push_back("Можно вписать и в ux0:data/VPKGJ/config.txt: url_games=, url_dlcs=, url_updates=");
+             modal.yes = "Ссылка на игры";
+             modal.action = [this]() {
+                 ime_purpose = IME_GAMES;
+                 ime::open("Ссылка на список игр (tsv)", settings.games_url, 400);
+             };
+             modal.alt = "Ссылка на DLC";
+             modal.alt_action = [this]() {
+                 ime_purpose = IME_DLCS;
+                 ime::open("Ссылка на список DLC (tsv)", settings.dlcs_url, 400);
+             };
+         }},
         {"Обновить каталог", catalog.version.empty() ? "" : "версия " + catalog.version, col::MUTED, [this]() { start_refresh(true); }},
         {"Скорость загрузки", std::string("‹ ") + SPEED_NAMES[speed_mode] + " ›", speed_mode ? col::ACCENT : col::MUTED, [this]() {
              speed_mode = (speed_mode + 1) % 5;
@@ -3162,19 +3196,19 @@ void App::draw_settings()
     float y = 68, rw = 600;
     for (int i = 0; i < (int)rows.size(); i++) {
         bool on = i == settings_sel;
-        gfx::rrect(28, y, rw, 40, 12, on ? col::SURFACE2 : gfx::alpha(col::SURFACE, 0.9f));
+        gfx::rrect(28, y, rw, 36, 12, on ? col::SURFACE2 : gfx::alpha(col::SURFACE, 0.9f));
         if (on)
-            gfx::rframe(28, y, rw, 40, 12, 2, col::ACCENT);
-        gfx::text(on ? gfx::bold : gfx::regular, 46, y + 26, 15, col::TEXT, rows[i].title);
-        gfx::text_right(gfx::regular, 28 + rw - 18, y + 26, 14, rows[i].vc, gfx::ellipsize(gfx::regular, 14, rows[i].value, 300));
+            gfx::rframe(28, y, rw, 36, 12, 2, col::ACCENT);
+        gfx::text(on ? gfx::bold : gfx::regular, 46, y + 24, 15, col::TEXT, rows[i].title);
+        gfx::text_right(gfx::regular, 28 + rw - 18, y + 24, 14, rows[i].vc, gfx::ellipsize(gfx::regular, 14, rows[i].value, 300));
         settings_actions.push_back(rows[i].fn);
         int idx = i;
-        hits.push_back({28, y, rw, 40, [this, idx]() {
+        hits.push_back({28, y, rw, 36, [this, idx]() {
                             if (settings_sel == idx && idx < (int)settings_actions.size())
                                 settings_actions[idx]();
                             settings_sel = idx;
                         }});
-        y += 44;
+        y += 40;
     }
     draw_about(68);
 }
@@ -3336,7 +3370,7 @@ void App::draw_about(float y)
     std::string pc = pkgj_config_path();
     std::vector<std::string> about = {
         "Свободно на ux0: " + fmt_size(free_cached()),
-        pc.empty() ? "Списки pkgj не найдены" : "pkgj: игр " + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
+        pc.empty() && settings.games_url.empty() ? "Списки игр не заданы" : "Игр "  + std::to_string(catalog.pkgj_games) + ", DLC " + std::to_string(catalog.pkgj_dlcs),
         "github.com/" APP_REPO,
         "GPL-3.0 · по мотивам pkgj и VitaShell",
     };

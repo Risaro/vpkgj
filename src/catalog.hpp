@@ -49,6 +49,9 @@ enum Status { ST_NONE, ST_INSTALLED, ST_UPDATE };
 struct Settings {
     std::string repo = "Risaro/vpkgj-db";
     std::string branch = "main";
+    std::string games_url;
+    std::string dlcs_url;
+    std::string updates_url;
     void load();
     void save() const;
     std::string base() const;

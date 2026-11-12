@@ -41,12 +41,19 @@ void Settings::load()
             repo = v;
         else if (k == "branch" && !v.empty())
             branch = v;
+        else if (k == "url_games")
+            games_url = v;
+        else if (k == "url_dlcs")
+            dlcs_url = v;
+        else if (k == "url_updates")
+            updates_url = v;
     }
 }
 
 void Settings::save() const
 {
-    fs::write(APP_DIR + "/config.txt", "repo=" + repo + "\nbranch=" + branch + "\n");
+    fs::write(APP_DIR + "/config.txt", "repo=" + repo + "\nbranch=" + branch + "\nurl_games=" + games_url + "\nurl_dlcs=" + dlcs_url +
+                                           "\nurl_updates=" + updates_url + "\n");
 }
 
 std::string Settings::base() const
@@ -175,10 +182,16 @@ static std::string pkgj_updates_url;
 
 bool pkgj_urls(std::string& games, std::string& dlcs)
 {
+    Settings own;
+    own.load();
+    games = own.games_url;
+    dlcs = own.dlcs_url;
+    if (!own.updates_url.empty())
+        pkgj_updates_url = own.updates_url;
     std::string path = pkgj_config_path();
     std::string text;
     if (path.empty() || !fs::read(path, text))
-        return false;
+        return !games.empty() || !dlcs.empty();
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
@@ -186,11 +199,11 @@ bool pkgj_urls(std::string& games, std::string& dlcs)
         std::string k, v;
         ls >> k >> v;
         k = lower(k);
-        if ((k == "url" || k == "url_games") && !v.empty())
+        if ((k == "url" || k == "url_games") && !v.empty() && own.games_url.empty())
             games = v;
-        else if (k == "url_dlcs" && !v.empty())
+        else if (k == "url_dlcs" && !v.empty() && own.dlcs_url.empty())
             dlcs = v;
-        else if (k == "url_updates" && !v.empty())
+        else if (k == "url_updates" && !v.empty() && own.updates_url.empty())
             pkgj_updates_url = v;
     }
     return !games.empty() || !dlcs.empty();
