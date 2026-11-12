@@ -3007,12 +3007,17 @@ void App::draw_settings()
 void App::start_preload()
 {
     std::vector<std::string> urls;
+    auto add = [&](const std::string& path) {
+        std::string u = catalog.media_url(path);
+        if (starts_with(u, "http://") || starts_with(u, "https://"))
+            urls.push_back(u);
+    };
     for (int c = 0; c < CAT_COUNT; c++)
         for (auto& e : catalog.items[c]) {
             if (!e.icon.empty())
-                urls.push_back(catalog.media_url(e.icon));
+                add(e.icon);
             if (!e.shots.empty())
-                urls.push_back(catalog.media_url(e.shots[0]));
+                add(e.shots[0]);
         }
     images.set_media(catalog.media);
     images.preload(urls, catalog.media, catalog.pack_id);
