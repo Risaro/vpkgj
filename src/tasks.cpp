@@ -650,6 +650,13 @@ static bool install_android(Task& t, const std::string& dl, std::string& err)
         if (!fetch_checked(t, links(e.url, e.mirror), dl, e.sha256, "APK", err))
             return false;
         bool ok = android_unpack(t, dl, dir, err);
+        if (ok && profile_value(e.profile, "keep_apk") == "1") {
+            sceIoRemove(own.c_str());
+            if (sceIoRename(dl.c_str(), own.c_str()) < 0) {
+                err = "Не удалось сохранить APK в " + own;
+                ok = false;
+            }
+        }
         sceIoRemove(dl.c_str());
         if (!ok)
             return false;
